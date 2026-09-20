@@ -1,0 +1,16 @@
+# Figure images are NOT versioned. They are converted to WebP at summarization
+# time and published to a private Google Drive folder with rclone (see the
+# publish_images rule in the paper_miner repo's Snakefile).
+imgs/
+*.part
+
+# Snakemake phase gates -- pipeline state, not vault content
+.summarize_done
+.images_published
+.vault_published
+
+# Editor / OS noise
+.obsidian/
+.DS_Store
+
+# index.json is tracked ON PURPOSE -- future search scripts read it.
