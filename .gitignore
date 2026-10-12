@@ -14,3 +14,8 @@ imgs/
 .DS_Store
 
 # index.json is tracked ON PURPOSE -- future search scripts read it.
+
+# Local search database, built from the notes by `python vault.py build`.
+# Derived and ~700 MB -- never committed (see README).
+vault.db
+vault.db-journal
