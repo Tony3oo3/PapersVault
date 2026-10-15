@@ -65,7 +65,7 @@ What it contains:
 
 | Table | Content |
 |-------|---------|
-| `papers` | one row per note: id, conference, year, title, authors, key contribution, primary task, paper type, task novelty, code link, note path, and `pdf_url` (empty until the notes carry that field) |
+| `papers` | one row per note: id, conference, year, title, authors, key contribution, primary task, paper type, task novelty, code link, note path, and `pdf_url` (the URL the PDF was downloaded from; null only for papers since withdrawn from the proceedings) |
 | `fts` | full-text index (SQLite FTS5, Porter stemming) over title, key contribution, Problem, Method, tags and keywords; its rowid is `papers.id` |
 | `tags` | every list-valued classification field (tasks, method family, datasets, keywords, ...), one row per value |
 | `relations` | every `builds_on` / `compares_to` entry; `vault_paper_id` is set when the cited title matches a paper in the vault |
