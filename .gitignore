@@ -19,3 +19,7 @@ imgs/
 # Derived and ~700 MB -- never committed (see README).
 vault.db
 vault.db-journal
+# DBLP lookups cached by `python vault.py bib`
+dblp_cache.db
+# Self-contained copy of a primer page (kit inlined) written by `python vault.py cards`
+research_topics/*/.bundle.html

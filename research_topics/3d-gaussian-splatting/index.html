@@ -1,0 +1,1800 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Gaussian Splatting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Source+Serif+4:wght@600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../_kit/primer.css">
+<style>
+  /* page-local helpers for the hand-drawn figures */
+  figure svg .mono { font-family: var(--mono); }
+  figure svg .lbl { font-size: 13px; }
+  figure svg .sm { font-size: 12px; }
+  figure svg .ttl { font-size: 14px; font-weight: 650; }
+  .readout { font: .85rem/1.5 var(--mono); color: var(--fg); background: var(--soft); border-radius: 8px; padding: 6px 10px; margin-top: 8px; }
+</style>
+</head>
+<body data-slug="3d-gaussian-splatting" data-vault="PapersVault">
+<header class="hero"><div class="wrap">
+  <div class="kicker">Research primer · PapersVault</div>
+  <h1>3D Gaussian Splatting</h1>
+  <p class="lede">Represent a 3D scene as millions of small, coloured, semi-transparent ellipsoids, and render it by projecting them onto the screen and blending them in depth order. That one change, from a neural network you query to a cloud of primitives you rasterise, made photo-real 3D capture run at hundreds of frames per second. Since 2024 it has been the default representation for much of 3D vision.</p>
+  <div class="meta"><span>For an ML/CV researcher new to 3D vision</span><span>1,486 papers, CVPR'24 to ECCV'26</span><span>vault.db 2026-10-16</span></div>
+</div></header>
+<div class="layout">
+<nav class="toc"></nav>
+<main>
+
+<div class="tldr">
+<p><b>The mental model.</b> Imagine reconstructing a room from 100 photos. NeRF, the 2020 approach, trains a neural network that answers "how dense and what colour is the space at point <i>x</i>?". It renders a pixel by asking that question hundreds of times along the pixel's ray. 3D Gaussian Splatting (3DGS, SIGGRAPH 2023) throws the network away. The scene is a list of a few million <b>Gaussian blobs</b>, each with a position, a shape (a 3×3 covariance), an opacity and a view-dependent colour. To render, you <b>project</b> every blob onto the image as a 2D ellipse, <b>sort</b> the ellipses by depth, and <b>alpha-blend</b> them front to back, exactly like stacking semi-transparent stickers.</p>
+<p>Every step is differentiable, so you fit the blobs to the photos by gradient descent. A heuristic adds blobs where the fit is poor and removes useless ones. Training takes minutes and rendering runs in real time.</p>
+<p>The field since then splits in two: fix what the blobs do badly (aliasing, memory, surfaces, motion), and stop optimising per scene by having a network <b>predict</b> the blobs in one forward pass.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="prereqs">What you need first</h2>
+
+<p>Four ideas from 3D vision and graphics carry the whole topic. If you know ML but not 3D, these are the gaps. Each fits in a few paragraphs.</p>
+
+<h3 id="nvs">The task: novel view synthesis</h3>
+<p>You get a set of photos of a static scene, and for each photo you know where the camera was: its <b>pose</b> (rotation and position, the "extrinsics") and its <b>intrinsics</b> (focal length, principal point). The task is to render the scene from a camera position nobody photographed. Doing that well means recovering something like the 3D scene, because occlusion, parallax and reflections all change with the viewpoint. Quality is scored by rendering the held-out test views and comparing them with the real photos using PSNR (pixel error, in dB, higher is better), SSIM (structural similarity) and LPIPS (a learned perceptual distance, lower is better).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 270" role="img" aria-label="Several posed cameras photograph an object; structure-from-motion triangulates matched features into sparse 3D points; a new camera position is the view to render.">
+  <defs><marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+  <!-- object -->
+  <rect x="310" y="122" width="80" height="58" rx="8" fill="var(--soft)" stroke="var(--line)" stroke-width="2"/>
+  <circle cx="350" cy="104" r="22" fill="var(--soft)" stroke="var(--line)" stroke-width="2"/>
+  <!-- SfM points -->
+  <g fill="var(--s3)">
+    <circle cx="312" cy="132" r="3.5"/><circle cx="321" cy="178" r="3.5"/><circle cx="388" cy="140" r="3.5"/><circle cx="374" cy="178" r="3.5"/>
+    <circle cx="334" cy="92" r="3.5"/><circle cx="350" cy="83" r="3.5"/><circle cx="330" cy="120" r="3.5"/><circle cx="388" cy="166" r="3.5"/><circle cx="347" cy="179" r="3.5"/><circle cx="371" cy="100" r="3.5"/>
+  </g>
+  <!-- triangulation rays -->
+  <line x1="170" y1="60" x2="365" y2="93" stroke="var(--s3)" stroke-dasharray="4 4"/>
+  <line x1="520" y1="50" x2="371" y2="98" stroke="var(--s3)" stroke-dasharray="4 4"/>
+  <circle cx="371" cy="100" r="6" fill="none" stroke="var(--s3)" stroke-width="2"/>
+  <!-- input cameras: apex at camera centre, opening toward the object -->
+  <g fill="var(--card)" stroke="var(--fg)" stroke-width="1.6">
+    <g transform="translate(110,170) rotate(-5)"><polygon points="0,0 34,-14 34,14"/></g>
+    <g transform="translate(170,60) rotate(27)"><polygon points="0,0 34,-14 34,14"/></g>
+    <g transform="translate(330,24) rotate(81)"><polygon points="0,0 34,-14 34,14"/></g>
+    <g transform="translate(520,50) rotate(150)"><polygon points="0,0 34,-14 34,14"/></g>
+    <g transform="translate(605,182) rotate(187)"><polygon points="0,0 34,-14 34,14"/></g>
+  </g>
+  <!-- novel camera -->
+  <g transform="translate(470,250) rotate(217)"><polygon points="0,0 34,-14 34,14" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 3"/></g>
+  <text x="20" y="205" class="lbl">input photo, known pose</text>
+  <text x="108" y="36" class="lbl">input photo</text>
+  <text x="408" y="205" class="lbl" fill="var(--s3)" style="fill:var(--s3)">sparse SfM points</text>
+  <text x="400" y="114" class="sm" style="fill:var(--s3)">one feature seen in two photos</text>
+  <text x="400" y="130" class="sm" style="fill:var(--s3)">→ triangulated 3D point</text>
+  <text x="498" y="252" class="lbl" style="fill:var(--accent)">novel view: render this</text>
+</svg>
+<figcaption><b>The setting.</b> Posed photos go in. Structure-from-motion (SfM) estimates the poses and a sparse cloud of 3D points (green). The goal is to render the dashed camera. 3DGS starts its Gaussians at the green points.</figcaption>
+</figure>
+
+<h3 id="sfm">Where the poses come from: structure-from-motion</h3>
+<p>Phones do not record precise camera poses, so they are estimated with <b>structure-from-motion</b>. In practice that means the COLMAP software (Schönberger &amp; Frahm, CVPR 2016, outside the vault). It detects keypoints in every photo and matches them across photos. It then solves jointly for all camera poses and the 3D positions of the matched points, minimising reprojection error; this joint optimisation is called <b>bundle adjustment</b>. You get the cameras plus a sparse point cloud, the green dots above.</p>
+<p>Two consequences matter later. First, 3DGS uses that point cloud as its starting point, so a bad SfM run means a bad reconstruction. Second, SfM is slow, fails with few or textureless views, and recovers the scene only up to an unknown global scale. Removing it is one of the main storylines of 2025–2026. The <a class="paper" data-paper="CVPR20240747">DUSt3R</a> and <a class="paper" data-paper="CVPR20250750">VGGT</a> line of networks predicts poses and geometry directly, and 3DGS papers have switched to building on them (numbers in <a href="#feedforward">Feed-forward reconstruction</a>).</p>
+
+<h3 id="volrend">Volume rendering and alpha compositing</h3>
+<p>This is the one equation to really understand. Treat the scene as semi-transparent fog with a colour at every point. A pixel's ray passes through a sequence of fog pieces, nearest first. Piece $i$ has colour $c_i$ and opacity $\alpha_i \in [0,1]$, the fraction of light it absorbs and replaces with its own colour. The pixel colour is</p>
+$$C \;=\; \sum_{i=1}^{N} c_i\,\alpha_i\,T_i, \qquad T_i \;=\; \prod_{j=1}^{i-1} (1-\alpha_j).$$
+<p>$T_i$ is the <b>transmittance</b>: the fraction of light from piece $i$ that survives all the pieces in front of it. It starts at 1 and only decreases. The product $w_i = \alpha_i T_i$ is how much piece $i$ contributes to the pixel. This is the painter's "over" operator from 1980s compositing. The order matters: the same pieces in a different order give a different colour. Once $T$ is nearly 0, everything further back is invisible and can be skipped ("early termination").</p>
+
+<figure class="widget">
+<svg id="comp" viewBox="0 0 700 270" role="img" aria-label="A pixel ray passes through five semi-transparent Gaussians; stepping through them shows the transmittance falling and the pixel colour accumulating."></svg>
+<div class="controls" id="compc"></div>
+<div class="readout" id="compr"></div>
+<figcaption><b>Front-to-back compositing along one pixel's ray.</b> Press <i>Step</i> to blend the next Gaussian. Bars show each one's weight $w_i=\alpha_i T_i$, and the swatch shows the pixel so far. Push opacity to 0.95 and the last Gaussian is never reached: $T$ falls below $10^{-4}$, the cut-off 3DGS uses (my recollection of the original paper). <i>Wrong order</i> blends back to front as if the far Gaussian were nearest; the colour changes, which is why 3DGS has to sort.</figcaption>
+</figure>
+
+<div class="callout intuition">
+<p>NeRF and 3DGS use <b>this same equation</b>. They differ in where the $\alpha_i$ come from. In NeRF, a network outputs a density $\sigma$ at sample points along the ray, and $\alpha_i = 1-\exp(-\sigma_i\,\delta_i)$, where $\delta_i$ is the spacing between samples. In 3DGS, $\alpha_i$ is a Gaussian blob's opacity times how close the pixel is to the blob's projected centre. Once that clicks, 3DGS reads as "NeRF's renderer with a different, explicit source of alphas".</p>
+</div>
+
+<h3 id="nerf">NeRF, and why it was slow</h3>
+<p><b>NeRF</b> (Mildenhall et al., ECCV 2020, outside the vault) stores the scene inside an MLP: $(\mathbf{x}, \mathbf{d}) \mapsto (\sigma, \mathbf{c})$. Here $\mathbf{x}$ is a 3D point, $\mathbf{d}$ the viewing direction, $\sigma$ the density and $\mathbf{c}$ the colour. Rendering a pixel means sampling maybe 100–200 points along its ray, running the MLP on each, and compositing. A 1-megapixel image needs about $10^8$ network evaluations. Quality was excellent; speed was seconds per frame and training took hours to days. In 2022, Plenoxels and Instant-NGP sped it up by replacing most of the MLP with explicit voxel grids or hash tables of features, but they still marched along rays.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 250" role="img" aria-label="Left: NeRF marches a ray from a pixel into the scene and queries a network at many samples. Right: 3DGS projects each Gaussian once onto the image, where it covers many pixels.">
+  <defs><marker id="arB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+        <marker id="arB2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+  <text x="20" y="22" class="ttl">NeRF: pixel → scene (ray marching)</text>
+  <polygon points="20,125 50,105 50,145" fill="var(--card)" stroke="var(--fg)" stroke-width="1.5"/>
+  <line x1="70" y1="45" x2="70" y2="205" stroke="var(--fg)" stroke-width="2"/>
+  <rect x="64" y="115" width="12" height="12" fill="var(--accent)"/>
+  <line x1="50" y1="125" x2="320" y2="125" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#arB)"/>
+  <g fill="var(--s2)">
+    <circle cx="100" cy="125" r="4"/><circle cx="120" cy="125" r="4"/><circle cx="140" cy="125" r="4"/><circle cx="160" cy="125" r="4"/><circle cx="180" cy="125" r="4"/><circle cx="200" cy="125" r="4"/><circle cx="220" cy="125" r="4"/><circle cx="240" cy="125" r="4"/><circle cx="260" cy="125" r="4"/><circle cx="280" cy="125" r="4"/><circle cx="300" cy="125" r="4"/>
+  </g>
+  <g stroke="var(--s2)" stroke-width="1"><line x1="160" y1="125" x2="190" y2="80"/><line x1="200" y1="125" x2="190" y2="80"/><line x1="240" y1="125" x2="190" y2="80"/></g>
+  <rect x="160" y="56" width="60" height="26" rx="5" fill="var(--card)" stroke="var(--s2)" stroke-width="1.5"/>
+  <text x="190" y="74" text-anchor="middle" class="sm">MLP(x, d)</text>
+  <text x="90" y="165" class="sm">one network query per sample,</text>
+  <text x="90" y="182" class="sm">~100s of samples per pixel,</text>
+  <text x="90" y="199" class="sm">~10⁸ queries per megapixel image</text>
+
+  <line x1="350" y1="20" x2="350" y2="235" stroke="var(--line)"/>
+
+  <text x="372" y="22" class="ttl">3DGS: scene → pixels (splatting)</text>
+  <polygon points="372,125 402,105 402,145" fill="var(--card)" stroke="var(--fg)" stroke-width="1.5"/>
+  <line x1="430" y1="45" x2="430" y2="205" stroke="var(--fg)" stroke-width="2"/>
+  <ellipse cx="560" cy="80" rx="40" ry="16" transform="rotate(-20 560 80)" fill="var(--s1)" fill-opacity=".35" stroke="var(--s1)"/>
+  <ellipse cx="610" cy="140" rx="22" ry="36" transform="rotate(15 610 140)" fill="var(--s3)" fill-opacity=".35" stroke="var(--s3)"/>
+  <ellipse cx="530" cy="180" rx="30" ry="12" fill="var(--s4)" fill-opacity=".35" stroke="var(--s4)"/>
+  <ellipse cx="430" cy="92" rx="5" ry="16" fill="var(--s1)" fill-opacity=".6"/>
+  <ellipse cx="430" cy="133" rx="5" ry="13" fill="var(--s3)" fill-opacity=".6"/>
+  <ellipse cx="430" cy="160" rx="5" ry="10" fill="var(--s4)" fill-opacity=".6"/>
+  <g stroke="var(--accent)" stroke-width="1.5"><line x1="520" y1="86" x2="440" y2="92" marker-end="url(#arB2)"/><line x1="590" y1="138" x2="440" y2="133" marker-end="url(#arB2)"/><line x1="502" y1="178" x2="440" y2="161" marker-end="url(#arB2)"/></g>
+  <text x="372" y="222" class="sm">each Gaussian is projected once; its 2D ellipse</text>
+  <text x="372" y="239" class="sm">covers many pixels. No network in the render loop.</text>
+</svg>
+<figcaption><b>Backward vs forward rendering.</b> NeRF starts from a pixel and asks the scene. 3DGS starts from the scene and pushes ("splats") each primitive onto the pixels it covers. That is how GPU rasterisers draw triangles, and it is why 3DGS is fast.</figcaption>
+</figure>
+
+<h3 id="splatting-history">Splatting: an old idea from point-based graphics</h3>
+<p>"Splatting" means drawing a point as a small footprint (a "splat") instead of a single pixel. The mathematical tool 3DGS borrows is <b>EWA splatting</b> (Zwicker et al., 2001–2002, outside the vault; cited as a foundation by 7 topic papers in the vault). It shows how to project a 3D Gaussian through a camera so that it lands on the image as a 2D Gaussian with a closed-form covariance. It also gives the low-pass filter that keeps splats from aliasing, which comes back in <a href="#fidelity">the fidelity sub-area</a>.</p>
+
+<table>
+<thead><tr><th>Foundation (outside the vault)</th><th class="num">topic papers building on it</th><th>What 3DGS takes from it</th></tr></thead>
+<tbody>
+<tr><td>3D Gaussian Splatting (Kerbl et al., ACM TOG / SIGGRAPH 2023)</td><td class="num">1,128</td><td>the method itself</td></tr>
+<tr><td>2D Gaussian Splatting (Huang et al., SIGGRAPH 2024)</td><td class="num">104</td><td>flat "surfel" Gaussians for accurate surfaces</td></tr>
+<tr><td>DreamFusion (ICLR 2023)</td><td class="num">49</td><td>score distillation: optimising 3D with a 2D diffusion model</td></tr>
+<tr><td>Instant-NGP (SIGGRAPH 2022)</td><td class="num">21</td><td>hash-grid features, reused for compression and deformation</td></tr>
+<tr><td>Dynamic 3D Gaussians (3DV 2024)</td><td class="num">15</td><td>the first Gaussians tracked through time</td></tr>
+<tr><td>3D Gaussian Ray Tracing (SIGGRAPH Asia 2024)</td><td class="num">14</td><td>rendering Gaussians by ray tracing instead of rasterising</td></tr>
+<tr><td>NeRF (ECCV 2020), Mip-NeRF 360 (CVPR 2022)</td><td class="num">8 each</td><td>the task, the compositing equation, the benchmarks</td></tr>
+<tr><td>EWA Volume Splatting (2001)</td><td class="num">7</td><td>projecting a 3D Gaussian to a 2D Gaussian</td></tr>
+</tbody></table>
+<p class="small muted">Counts: topic papers listing the work in <code>builds_on</code> (vault.py, "works most built upon ... not in the vault"). NeRF's count is low because, by 2024, papers build on 3DGS rather than on NeRF directly.</p>
+
+<!-- ================================================================== -->
+<h2 id="core-idea">The core idea, from first principles</h2>
+
+<p>We build 3DGS in six steps. At each step, ask "why this choice and not another?", because most of the follow-up literature is someone answering that question differently.</p>
+
+<h3 id="step1">Step 1. A scene is a cloud of soft blobs</h3>
+<p>Why blobs and not triangles or voxels? Triangle meshes are what GPUs draw fastest, but you cannot easily optimise a mesh's <i>connectivity</i> by gradient descent: adding a hole or merging two surfaces is a discrete change. Voxel grids are easy to optimise but waste memory on empty space and have a fixed resolution. An unstructured set of <b>soft</b> primitives is the compromise. Each one is independent, so you can add or delete them freely. Each is smooth, so the image changes smoothly as a primitive moves, and gradients flow. And empty space costs nothing because nothing is there.</p>
+<p>The Gaussian is chosen for three properties. It has a closed-form projection: a 3D Gaussian seen through an (approximately linear) camera is a 2D Gaussian. It is smooth everywhere. And it has a compact parameterisation: a centre and a covariance.</p>
+
+<h3 id="step2">Step 2. The shape of a blob is its covariance</h3>
+<p>A 3D Gaussian centred at $\boldsymbol\mu$ is</p>
+$$G(\mathbf{x}) \;=\; \exp\!\Big(-\tfrac12 (\mathbf{x}-\boldsymbol\mu)^\top \Sigma^{-1} (\mathbf{x}-\boldsymbol\mu)\Big).$$
+<p>$\boldsymbol\mu\in\mathbb{R}^3$ is where the blob sits. $\Sigma$ is a 3×3 <b>covariance</b> matrix that sets its shape: how far it extends along each direction and how it is tilted. Note there is no normalising constant. The peak value is 1, and a separate opacity $o\in[0,1]$ scales it. If $\Sigma$ is diagonal with equal entries, the blob is a sphere. With unequal diagonal entries it is an axis-aligned ellipsoid. Off-diagonal entries tilt it. Being able to stretch a blob into a thin needle or a flat pancake (<b>anisotropy</b>) is what lets a few million blobs represent sharp edges and flat walls.</p>
+<p>Here is the catch. Not every 3×3 matrix is a valid covariance: it must be symmetric and <b>positive semi-definite</b> (no negative variance in any direction). If you let gradient descent update the nine entries freely, one step can make $\Sigma$ invalid, and then the "ellipsoid" does not exist. 3DGS therefore factorises it:</p>
+$$\Sigma = R\,S\,S^\top R^\top,$$
+<p>where $S=\mathrm{diag}(s_1,s_2,s_3)$ holds the three axis lengths and $R$ is a rotation, stored as a unit quaternion (4 numbers). Any $R$ and $S$ give a valid covariance, so the optimiser can wander freely. In practice the scales are stored as logs and passed through an exponential, which keeps them positive.</p>
+
+<figure class="widget">
+<svg id="g2d" viewBox="0 0 700 300" role="img" aria-label="A 2D Gaussian drawn as nested ellipses; sliders change its two scales and rotation, and the covariance matrix updates beside it."></svg>
+<div class="controls" id="g2dc"></div>
+<figcaption><b>Covariance as a stretched, rotated ellipse</b> (2D, so it fits on a screen; 3D works the same way). The scales $s_1, s_2$ and the angle $\theta$ build $\Sigma=RSS^\top R^\top$, which is always valid. The last slider instead nudges one entry of $\Sigma$ directly, the way an unconstrained optimiser would. Push it far enough and the determinant goes negative: there is no longer any ellipse to draw.</figcaption>
+</figure>
+
+<div class="callout example">
+<p>Take $s_1=2$, $s_2=0.5$ and $\theta=30^\circ$. Then $\cos\theta=0.866$ and $\sin\theta=0.5$, and</p>
+$$\Sigma = R\begin{pmatrix}4&0\\0&0.25\end{pmatrix}R^\top = \begin{pmatrix}4(0.75)+0.25(0.25) & (4-0.25)(0.433)\\ \cdot & 4(0.25)+0.25(0.75)\end{pmatrix} = \begin{pmatrix}3.06 & 1.62\\ 1.62 & 1.19\end{pmatrix}.$$
+<p>Check: $\det\Sigma = 3.06\cdot1.19-1.62^2 \approx 1.0 = (s_1 s_2)^2$. The determinant is the squared area factor, and it is positive by construction. Set those values on the sliders and you get this matrix.</p>
+</div>
+
+<h3 id="step3">Step 3. Colour that changes with viewpoint</h3>
+<p>A shiny surface looks different from different angles, so a blob's colour must depend on the viewing direction $\mathbf d$. 3DGS gives each blob a small function on the sphere of directions, written in <b>spherical harmonics</b> (SH): the Fourier basis of the sphere. Degree 0 is a constant colour, degree 1 adds a linear tilt, and higher degrees add finer angular detail. With degree 3 there are $1+3+5+7=16$ coefficients per colour channel, so <b>48 numbers per blob</b>. That is most of a blob's memory, as you will see in <a href="#compact">Compact and fast</a>.</p>
+$$\mathbf{c}(\mathbf d) = \sum_{\ell=0}^{3}\sum_{m=-\ell}^{\ell} \mathbf{k}_{\ell m}\, Y_{\ell m}(\mathbf d)$$
+<p>$Y_{\ell m}$ are the fixed SH basis functions and $\mathbf k_{\ell m}\in\mathbb R^3$ are the learned RGB coefficients. Everything a blob stores is now: position (3), scale (3), rotation (4), opacity (1) and SH (48), <b>59 floats</b>.</p>
+
+<h3 id="step4">Step 4. Projecting a blob onto the screen</h3>
+<p>To draw a blob, we need the 2D Gaussian it becomes on the image. A camera applies a rigid transform $W$ (world → camera coordinates), then perspective division, which is non-linear. EWA splatting's trick is to linearise the perspective step around the blob's centre with its Jacobian $J$. A Gaussian pushed through a linear map stays Gaussian, with covariance transformed as $A\Sigma A^\top$, so</p>
+$$\Sigma' = J\,W\,\Sigma\,W^\top J^\top, \qquad \Sigma^{2D} = \text{top-left } 2{\times}2 \text{ block of } \Sigma'.$$
+<p>$W$ rotates the blob into the camera's frame. $J$ is the 2×3 local derivative of "3D point → pixel" at the blob's centre, so it says how much one unit of 3D motion moves you on screen at that depth: things far away shrink. Dropping the third row and column means looking along the optical axis. This is an approximation: for a big blob seen at a wide angle, the true projection is not quite an ellipse. Later work (<a class="paper" data-paper="ICCV20251851">EVER</a>, <a class="paper" data-paper="CVPR20252072">Geometry Field Splatting</a>) revisits exactly this approximation.</p>
+<p>The <a class="paper" data-paper="CVPR20241019">Mip-Splatting</a> paper restates the original pipeline and adds a detail you need to know. 3DGS adds a fixed 2D "dilation" to every projected covariance ($\Sigma^{2D}+0.3\,I$, in pixel units) so no splat is smaller than a pixel. Remember that 0.3; it causes the zoom artifacts in <a href="#fidelity">Fidelity</a>.</p>
+
+<h3 id="step5">Step 5. Blend, in depth order</h3>
+<p>For a pixel $\mathbf p$, each projected blob $i$ contributes an alpha</p>
+$$\alpha_i(\mathbf p) = o_i \exp\!\Big(-\tfrac12(\mathbf p-\boldsymbol\mu_i^{2D})^\top (\Sigma_i^{2D})^{-1}(\mathbf p-\boldsymbol\mu_i^{2D})\Big),$$
+<p>where $o_i$ is its learned opacity and $\boldsymbol\mu^{2D}_i$ its projected centre. That is "opacity × how close the pixel is to the blob's centre, in the blob's own metric". Then comes the compositing sum from the prerequisites, over the blobs <b>sorted by depth</b>:</p>
+$$C(\mathbf p) = \sum_i \mathbf c_i(\mathbf d)\,\alpha_i(\mathbf p)\prod_{j\lt i}\big(1-\alpha_j(\mathbf p)\big).$$
+<p>One subtlety explains a lot of later work. 3DGS sorts blobs <b>once per image</b>, by the depth of their centres, not per pixel along each ray. When two blobs overlap in depth, the order can be wrong for some pixels, and it can flip as the camera moves, producing "popping". Rasterisation also ignores that a blob has extent along the ray. These shortcuts are what make it fast, and they are what <a class="paper" data-paper="ICCV20251851">EVER</a> and the ray-tracing line give up speed to fix.</p>
+
+<div class="compare">
+<div><h4>NeRF</h4><ul class="small">
+<li><b>Scene:</b> implicit, an MLP (or grid + MLP).</li>
+<li><b>Render:</b> march every ray and query the network at each sample.</li>
+<li><b>Empty space:</b> still sampled, unless you add acceleration structures.</li>
+<li><b>Edit:</b> hard; the scene is spread through the network's weights.</li>
+<li><b>Memory:</b> small (MBs).</li>
+</ul></div>
+<div><h4>3D Gaussian Splatting</h4><ul class="small">
+<li><b>Scene:</b> explicit, a list of millions of primitives.</li>
+<li><b>Render:</b> project, sort once, alpha-blend; real time.</li>
+<li><b>Empty space:</b> free; there are no primitives there.</li>
+<li><b>Edit:</b> select, delete or move primitives directly.</li>
+<li><b>Memory:</b> large (hundreds of MB per scene).</li>
+</ul></div>
+</div>
+
+<h3 id="step6">Step 6. Fitting it: gradient descent plus adaptive density control</h3>
+<p>Every operation above is differentiable in the blob parameters, so you can render a training view, compare it with the photo, and backpropagate. The loss in the original paper is a mix of L1 and D-SSIM (structural dissimilarity), weighted 0.8 / 0.2 (my recollection). Training runs for about 30k iterations, one random training view per iteration.</p>
+<p>Gradient descent alone cannot fix the <b>number</b> of blobs. A Gaussian has local support. As the <a class="paper" data-paper="CVPR20241339">pixelSplat</a> paper puts it, gradients "vanish if the distance to the correct location exceeds more than a few standard deviations". A region with no blob nearby never attracts one, and one big blob covering detail cannot turn itself into three small ones. So 3DGS interleaves the optimiser with <b>adaptive density control</b> (ADC), run every 100 iterations (my recollection of the original paper). It accumulates the size of each blob's positional gradient in screen space over many views. If that gradient is large, the blob is being pulled hard because it is not explaining its pixels, and:</p>
+<ul>
+<li>if the blob is <b>small</b> (under-reconstruction: missing geometry nearby), it is <b>cloned</b> and the copy moved along the gradient;</li>
+<li>if the blob is <b>large</b> (over-reconstruction: one blob smeared over detail), it is <b>split</b> into two smaller ones (scales divided by 1.6, positions sampled from the original);</li>
+<li>blobs with opacity below 0.005 are <b>pruned</b>; every few thousand iterations all opacities are reset to a small value so that "floaters" have to justify themselves again.</li>
+</ul>
+<p>These rules are what <a class="paper" data-paper="NEURIPS20242572">3DGS-MCMC</a> criticises as "carefully engineered cloning and splitting heuristics". They depend on a good SfM initialisation, they make the final blob count (and memory) hard to predict, and they need tuned thresholds. A whole sub-area tries to replace them.</p>
+
+<figure class="widget">
+<svg id="dens" viewBox="0 0 700 300" role="img" aria-label="A 1D toy: Gaussians are fitted to a target signal by gradient descent, then cloned, split or pruned based on their accumulated positional gradients."></svg>
+<div class="controls" id="densc"></div>
+<div class="readout" id="densr"></div>
+<figcaption><b>Adaptive density control in 1D.</b> Grey is the target signal. The coloured bumps are the Gaussians and the dark line is their sum. <i>Optimise</i> runs 150 gradient steps, each on a random window of the signal (a "view"), and accumulates every Gaussian's positional-gradient size. <i>Densify</i> clones small Gaussians with a large gradient (green), splits large ones (orange) and prunes faint ones. Alternate the two buttons, or press <i>Auto</i>. Optimising alone stalls with too few bumps; this is the reason density control exists. Simplification: the 1D toy adds bumps instead of alpha-compositing them.</figcaption>
+</figure>
+
+<!-- ================================================================== -->
+<h2 id="anatomy">Anatomy of the canonical method</h2>
+
+<p>Here is the whole pipeline as the GPU runs it, with the tensors passed between stages. The design goal is that no stage needs anything per-pixel-per-primitive except the final blending, and that blending touches only the blobs overlapping that pixel's tile.</p>
+
+<figure class="diagram bleed">
+<svg viewBox="0 0 780 260" role="img" aria-label="Pipeline: N Gaussians with 59 parameters are projected to 2D means and covariances, binned into 16 by 16 pixel tiles with depth keys, radix sorted, then blended per pixel; the loss gradient flows back to all parameters.">
+  <defs><marker id="arC" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+        <marker id="arC2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--s2)"/></marker></defs>
+  <g fill="var(--card)" stroke="var(--fg)" stroke-width="1.4">
+    <rect x="10" y="40" width="134" height="110" rx="10"/><rect x="166" y="40" width="134" height="110" rx="10"/><rect x="322" y="40" width="134" height="110" rx="10"/><rect x="478" y="40" width="134" height="110" rx="10"/><rect x="634" y="40" width="136" height="110" rx="10"/>
+  </g>
+  <g class="ttl"><text x="77" y="62" text-anchor="middle">3D Gaussians</text><text x="233" y="62" text-anchor="middle">Project</text><text x="389" y="62" text-anchor="middle">Bin into tiles</text><text x="545" y="62" text-anchor="middle">Sort</text><text x="702" y="62" text-anchor="middle">Blend</text></g>
+  <g class="sm mono">
+    <text x="22" y="86">N × 59 floats</text><text x="22" y="104">μ 3 · s 3 · q 4</text><text x="22" y="122">o 1 · SH 48</text><text x="22" y="140" style="fill:var(--muted)">N ≈ 1–6 M</text>
+    <text x="178" y="86">per Gaussian:</text><text x="178" y="104">μ²ᴰ 2 · Σ²ᴰ 3</text><text x="178" y="122">depth 1 · rgb 3</text><text x="178" y="140" style="fill:var(--muted)">cull off-screen</text>
+    <text x="334" y="86">one key per</text><text x="334" y="104">(Gaussian, tile):</text><text x="334" y="122">tile id | depth</text><text x="334" y="140" style="fill:var(--muted)">M ≈ k·N keys</text>
+    <text x="490" y="86">GPU radix sort</text><text x="490" y="104">→ per tile, a</text><text x="490" y="122">front-to-back list</text><text x="490" y="140" style="fill:var(--muted)">one sort per image</text>
+    <text x="646" y="86">per pixel: walk</text><text x="646" y="104">its tile's list,</text><text x="646" y="122">stop at T &lt; 10⁻⁴</text><text x="646" y="140" style="fill:var(--muted)">→ H × W × 3</text>
+  </g>
+  <g stroke="var(--fg)" stroke-width="1.4"><line x1="144" y1="95" x2="164" y2="95" marker-end="url(#arC)"/><line x1="300" y1="95" x2="320" y2="95" marker-end="url(#arC)"/><line x1="456" y1="95" x2="476" y2="95" marker-end="url(#arC)"/><line x1="612" y1="95" x2="632" y2="95" marker-end="url(#arC)"/></g>
+  <text x="233" y="30" text-anchor="middle" class="sm" style="fill:var(--muted)">Σ' = J W Σ Wᵀ Jᵀ</text>
+  <text x="389" y="30" text-anchor="middle" class="sm" style="fill:var(--muted)">16 × 16 px tiles</text>
+  <!-- backward -->
+  <path d="M702,150 L702,200 L77,200 L77,152" fill="none" stroke="var(--s2)" stroke-width="1.6" marker-end="url(#arC2)"/>
+  <text x="390" y="193" text-anchor="middle" class="lbl" style="fill:var(--s2)">loss (L1 + D-SSIM vs photo) → gradients for all 59 parameters of every Gaussian</text>
+  <rect x="160" y="216" width="460" height="34" rx="8" fill="var(--soft)" stroke="var(--line)"/>
+  <text x="390" y="238" text-anchor="middle" class="lbl">every 100 iterations: clone / split / prune (adaptive density control)</text>
+</svg>
+<figcaption><b>The rasteriser, stage by stage.</b> Tile size, the sort and the early-termination threshold are from the original paper (outside the vault; my recollection). The backward pass retraces the per-tile lists in reverse; it never needs ray samples, which is why training takes minutes.</figcaption>
+</figure>
+
+<div class="steps">
+<div><p><b>Initialise from SfM points.</b> One Gaussian per COLMAP point, with an isotropic scale set from the distance to its nearest neighbours. <i>Why:</i> a good starting geometry saves the optimiser from hunting for surfaces through empty space. <i>Without it:</i> random initialisation works much worse in the original method. <a class="paper" data-paper="NEURIPS20242572">3DGS-MCMC</a> reports Mip-NeRF 360 PSNR 27.89 for 3DGS from random init vs 29.30 from SfM (in its own evaluation), and closes most of that gap with its sampler (29.72).</p></div>
+<div><p><b>Project and cull.</b> Compute $\boldsymbol\mu^{2D}$, $\Sigma^{2D}$ (plus the 0.3 px dilation), depth and view-dependent colour for every Gaussian in parallel; drop those outside the frustum. <i>Why:</i> it is one small, independent computation per primitive, which is ideal for a GPU.</p></div>
+<div><p><b>Bin into tiles and sort.</b> The screen is cut into 16×16-pixel tiles. Each Gaussian emits one key per tile its ellipse touches. The key packs tile ID (high bits) and depth (low bits), so one global radix sort yields every tile's list in depth order. <i>Why:</i> sorting once per image instead of once per pixel is the key speed trick. <i>Cost:</i> the ordering is approximate (Step 5), and loose bounding boxes waste work. <a class="paper" data-paper="CVPR20251482">Speedy-Splat</a> tightens the boxes to the ellipse at the 1/255 alpha threshold and gets 1.81× and 1.99× speed-ups from the two tightening steps alone, with no quality loss.</p></div>
+<div><p><b>Blend per pixel.</b> One GPU thread block per tile loads that tile's Gaussians into shared memory, and each thread (pixel) composites front to back until $T\lt 10^{-4}$. <i>Why:</i> memory locality, and early termination makes cost scale with visible, not total, complexity.</p></div>
+<div><p><b>Backpropagate and control density.</b> Gradients flow to all parameters, positions included. Every 100 iterations, ADC clones, splits and prunes. <i>Without it:</i> under-reconstructed regions stay empty (try the 1D widget with only <i>Optimise</i>).</p></div>
+</div>
+
+<p>What does this buy? The cleanest single source in the vault is the Mip-NeRF 360 table reproduced by <a class="paper" data-paper="NEURIPS20244446">LightGaussian</a>, which puts the NeRF-family baselines and 3DGS on the same axes.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 290" role="img" aria-label="Scatter of rendering speed (log FPS) against PSNR on Mip-NeRF 360: Mip-NeRF 360 is highest quality but 0.06 FPS; 3D-GS and LightGaussian reach about 27.2 dB at 134 to 237 FPS.">
+  <rect x="480" y="30" width="180" height="200" fill="var(--accent-soft)" opacity=".7"/>
+  <text x="570" y="248" text-anchor="middle" class="sm" style="fill:var(--accent)">real time (≥ 30 FPS)</text>
+  <g stroke="var(--line)"><line x1="70" y1="30" x2="660" y2="30"/><line x1="70" y1="66.4" x2="660" y2="66.4"/><line x1="70" y1="102.7" x2="660" y2="102.7"/><line x1="70" y1="139.1" x2="660" y2="139.1"/><line x1="70" y1="175.5" x2="660" y2="175.5"/><line x1="70" y1="211.8" x2="660" y2="211.8"/></g>
+  <line x1="70" y1="230" x2="660" y2="230" stroke="var(--muted)"/>
+  <g class="sm" text-anchor="end" style="fill:var(--muted)"><text x="62" y="34">28</text><text x="62" y="70">27</text><text x="62" y="107">26</text><text x="62" y="143">25</text><text x="62" y="179">24</text><text x="62" y="216">23</text></g>
+  <g class="sm" text-anchor="middle" style="fill:var(--muted)"><text x="70" y="266">0.01</text><text x="188" y="266">0.1</text><text x="306" y="266">1</text><text x="424" y="266">10</text><text x="542" y="266">100</text><text x="660" y="266">1000</text></g>
+  <text x="365" y="284" text-anchor="middle" class="sm" style="fill:var(--muted)">rendering speed, FPS (log scale)</text>
+  <text x="18" y="130" class="sm" style="fill:var(--muted)" transform="rotate(-90 18 130)" text-anchor="middle">PSNR (dB)</text>
+  <g>
+    <circle cx="161.8" cy="41.3" r="7" fill="var(--s2)"/><text x="174" y="45" class="lbl">Mip-NeRF 360 · 8.6 MB</text>
+    <circle cx="421" cy="117.6" r="7" fill="var(--s2)"/><text x="410" y="122" text-anchor="end" class="lbl">Instant-NGP (big) · 48 MB</text>
+    <circle cx="404.2" cy="208.9" r="7" fill="var(--s2)"/><text x="392" y="213" text-anchor="end" class="lbl">Plenoxels · 2.1 GB</text>
+    <circle cx="557" cy="58.7" r="7" fill="var(--s1)"/><text x="548" y="48" text-anchor="end" class="lbl">3D-GS · 734 MB</text>
+    <circle cx="586.2" cy="61.7" r="7" fill="var(--s3)"/><text x="592" y="86" text-anchor="middle" class="lbl">LightGaussian · 45 MB</text>
+  </g>
+</svg>
+<figcaption><b>Speed vs quality on Mip-NeRF 360</b>, numbers from Table 1 of <a class="paper" data-paper="NEURIPS20244446">LightGaussian</a> (checked against its OCR; the quality columns are inherited from the original 3DGS paper). 3DGS gives up 0.5 dB to the best NeRF but is ~2,000× faster. The catch is memory: 734 MB vs 8.6 MB. That catch launched the compression sub-area; LightGaussian's own point shows how much of it is redundant.</figcaption>
+</figure>
+
+<div class="callout opinion">
+<p>3DGS did not win on image quality. On Mip-NeRF 360 it was below Mip-NeRF 360 itself. It won because it moved the field onto <b>rasterisation</b>, the operation GPUs, game engines and web viewers are built around, and because the scene became an explicit list that downstream code can select, deform, simulate and segment. Most of the 1,486 papers in this vault use the second property, not the first.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="evolution">How the field evolved</h2>
+
+<p>The story is easiest to follow as a sequence of complaints about the original method, each answered by a line of work. Dates are submission deadlines, since that is when the work was done.</p>
+
+<div class="steps">
+<div><p><b>Aug 2023 → deadlines Sep–Nov 2023 (ICLR'24, CVPR'24): "it works; now make it do everything NeRF did."</b> Within three months of 3DGS appearing, the CVPR'24 crop ported every NeRF extension to Gaussians. Dynamic scenes: <a class="paper" data-paper="CVPR20242189">Deformable 3DGS</a>, <a class="paper" data-paper="CVPR20240949">4DGS</a>. Avatars: <a class="paper" data-paper="CVPR20241188">GaussianAvatars</a>. Meshes: <a class="paper" data-paper="CVPR20242220">SuGaR</a>. Language fields: <a class="paper" data-paper="CVPR20240858">LangSplat</a>. SLAM: <a class="paper" data-paper="CVPR20241810">SplaTAM</a>. Generation: <a class="paper" data-paper="ICLR20241330">DreamGaussian</a>. Physics: <a class="paper" data-paper="CVPR20241250">PhysGaussian</a>. The first problems with the method itself were also named: aliasing (<a class="paper" data-paper="CVPR20241019">Mip-Splatting</a>) and redundancy (<a class="paper" data-paper="CVPR20242478">Scaffold-GS</a>). And <a class="paper" data-paper="CVPR20241339">pixelSplat</a> showed a network could predict Gaussians from two images.</p></div>
+<div><p><b>Deadlines Mar–Sep 2024 (ECCV'24, NeurIPS'24, ICLR'25): "it is too big, and the heuristics are fragile."</b> Compression goes from pruning plus codebooks (<a class="paper" data-paper="NEURIPS20244446">LightGaussian</a>) to entropy coding with context models (<a class="paper" data-paper="ECCV20240185">HAC</a>). Density control gets a principled reformulation (<a class="paper" data-paper="NEURIPS20242572">3DGS-MCMC</a>). Feed-forward models get cost volumes (<a class="paper" data-paper="ECCV20240557">MVSplat</a>) and transformer scale (<a class="paper" data-paper="ECCV20240564">GS-LRM</a>). <a class="paper" data-paper="ICLR20251940">NoPoSplat</a> drops the need for poses.</p></div>
+<div><p><b>Deadlines Nov 2024–May 2025 (CVPR'25, ICCV'25, NeurIPS'25): "real captures are casual, sparse and moving."</b> Monocular video with foundation-model depth and tracks (<a class="paper" data-paper="ICCV20251580">Shape of Motion</a>, <a class="paper" data-paper="CVPR20252444">MoSca</a>). Fast motion without a canonical space (<a class="paper" data-paper="CVPR20252768">FreeTimeGS</a>). Geometry backbones that replace SfM (<a class="paper" data-paper="CVPR20250750">VGGT</a>). Large generative 3D latents (<a class="paper" data-paper="CVPR20250184">TRELLIS</a>). And a challenger with no 3D representation at all (<a class="paper" data-paper="ICLR20252162">LVSM</a>).</p></div>
+<div><p><b>Deadlines Sep 2025–Mar 2026 (ICLR'26, CVPR'26, ECCV'26): "predict everything, in one pass, on top of a geometry foundation model."</b> VGGT-style backbones with Gaussian heads (<a class="paper" data-paper="ICLR20261363">YoNoSplat</a>, <a class="paper" data-paper="ICML20262881">WorldMirror</a>, and feed-forward 4D with <a class="paper" data-paper="CVPR20261737">MoVieS</a>). Moving away from one-Gaussian-per-pixel (<a class="paper" data-paper="ECCV20262102">GlobalSplat</a>, <a class="paper" data-paper="CVPR20262098">Off The Grid</a>). Per-scene optimisation keeps going too: training in ~2 minutes (<a class="paper" data-paper="CVPR20262382">FastGS</a>), learned density control (<a class="paper" data-paper="ICML20263465">LeGS</a>), and sort-free stochastic ray tracing (<a class="paper" data-paper="CVPR20263296">Stochastic RT</a>).</p></div>
+</div>
+
+<p>Two numbers make the shift concrete. In the vision venues (CVPR/ECCV/ICCV), the share of topic papers listing the original 3DGS paper in <code>builds_on</code> fell from 94% (165 of 175, 2024) to 78% (2025) and 68% (2026). The field now builds on its own descendants. Meanwhile, <a class="paper" data-paper="CVPR20250750">VGGT</a> went from 2 topic papers building on it in 2025 to 33 in 2026, overtaking <a class="paper" data-paper="CVPR20240747">DUSt3R</a> (14 in 2025, 2 in 2026). Geometry foundation models have become the new initialisation.</p>
+
+<p>The lineage graph below is computed from the <code>builds_on</code> relations inside the topic. An arrow A → B means B builds on A. The original 3DGS paper is left out of the graph because nearly everything builds on it. Click a node to open its card.</p>
+
+<pre class="mermaid">
+flowchart LR
+  subgraph before["earlier work (count: topic papers building on it)"]
+    ext1(["3D Gaussian Splatting for Real-Time ...&lt;br/&gt;ACM TOG 2023 · 1128"]):::ext
+    ext2(["FLAME face model&lt;br/&gt;ACM TOG 2017 · 17"]):::ext
+    ext3(["Dynamic 3D Gaussians&lt;br/&gt;3DV 2024 · 15"]):::ext
+    ext4(["Segment anything&lt;br/&gt;ICCV 2023 · 13"]):::ext
+  end
+  subgraph y2024["2024"]
+    CVPR20242478["Scaffold-GS&lt;br/&gt;CVPR'24"]
+    CVPR20240949["4DGS (Wu et al.)&lt;br/&gt;CVPR'24"]
+    CVPR20242189["Deformable 3DGS&lt;br/&gt;CVPR'24"]
+    CVPR20241188["GaussianAvatars&lt;br/&gt;CVPR'24"]
+    ECCV20240557["MVSplat&lt;br/&gt;ECCV'24"]
+    CVPR20240557["Gaussian Splatting SLAM&lt;br/&gt;CVPR'24"]
+    CVPR20240858["LangSplat&lt;br/&gt;CVPR'24"]
+    ECCV20240185["HAC&lt;br/&gt;ECCV'24"]
+    ECCV20240395["Per-Gaussian Embedding Deformation&lt;br/&gt;ECCV'24"]
+    CVPR20241427["DrivingGaussian&lt;br/&gt;CVPR'24"]
+    NEURIPS20243408["FreeSplat&lt;br/&gt;NEURIPS'24"]
+  end
+  subgraph y2025["2025"]
+    ICCV20251589["GUAVA&lt;br/&gt;ICCV'25"]
+    CVPR20252439["DepthSplat&lt;br/&gt;CVPR'25"]
+    ICCV20251524["4D Gaussian Splatting SLAM&lt;br/&gt;ICCV'25"]
+    CVPR20252405["4D LangSplat&lt;br/&gt;CVPR'25"]
+  end
+  subgraph y2026["2026"]
+    ECCV20261520["DLGStream&lt;br/&gt;ECCV'26"]
+    CVPR20262066["ST4R-Splat&lt;br/&gt;CVPR'26"]
+    CVPR20263070["Consistent Instance Field&lt;br/&gt;CVPR'26"]
+  end
+  ext2 -.-> CVPR20241188
+  ext2 -.-> ICCV20251589
+  ext3 -.-> CVPR20263070
+  ext4 -.-> CVPR20240858
+  CVPR20240557 --> ICCV20251524
+  CVPR20240858 --> CVPR20252405
+  CVPR20240858 --> ECCV20261520
+  CVPR20240949 --> CVPR20241427
+  CVPR20240949 --> CVPR20262066
+  CVPR20240949 --> CVPR20263070
+  CVPR20240949 --> ECCV20240395
+  CVPR20241188 --> ICCV20251589
+  CVPR20242189 --> CVPR20263070
+  CVPR20242189 --> ECCV20240395
+  CVPR20242478 --> ECCV20240185
+  CVPR20242478 --> ECCV20261520
+  CVPR20252405 --> CVPR20262066
+  CVPR20252405 --> ECCV20261520
+  ECCV20240557 --> CVPR20252439
+  ECCV20240557 --> NEURIPS20243408
+  classDef ext stroke-dasharray: 4 3
+</pre>
+<p class="small muted">From <code>vault.py lineage --ids-file topic_ids.txt --nodes 18 --roots 4</code>; labels shortened by hand. The graph favours 2024 papers because they have had the most time to be built on. The VGGT-era frontier does not show up here yet; read it in the sub-areas.</p>
+
+<!-- ================================================================== -->
+<h2 id="subareas">The sub-areas</h2>
+
+<p>Six lines of work, each with its share of the 1,486 topic papers (title + contribution queries, overlapping, so the shares do not sum to 100%): fixing fidelity (~12%), compact and fast (~16%), surfaces (~12%), dynamics and avatars (~34%), feed-forward reconstruction (~16%, the fastest-growing), and Gaussians as a general 3D substrate (generation, semantics, editing, SLAM, physics, driving; ~47% on a broad query whose precision was not sampled).</p>
+
+<!-- ------------------------------------------------------------------ -->
+<h3 id="fidelity">1 · Fidelity: aliasing, density control, and the primitive itself</h3>
+<p><b>The problem.</b> A trained 3DGS scene looks perfect from the training cameras and breaks in characteristic ways elsewhere. The cleanest case is <b>changing the sampling rate</b>: zooming in or out, or moving the camera closer or further. The optimiser happily makes some Gaussians tinier than a pixel, because the fixed 0.3 px dilation from Step 4 inflates them back to pixel size anyway. <a class="paper" data-paper="CVPR20241019">Mip-Splatting</a> diagnoses both failure modes. Zoom in, and those degenerate needles are now smaller than the screen-space dilation would make them, so thin structures erode and you see high-frequency artifacts. Zoom out, and every splat is still dilated to at least a pixel, which "spreads radiance in a physically incorrect way", so thin structures turn too bright and thick.</p>
+<p><b>The key insight</b> is signal processing, not deep learning. A camera that sees a region with pixel spacing $\hat T$ (in world units, at that depth) can only constrain frequencies up to the Nyquist limit $1/(2\hat T)$. So no Gaussian should be sharper than the <i>finest</i> training camera that sees it can justify. Mip-Splatting enforces this with a <b>3D smoothing filter</b>: convolve each Gaussian with an isotropic Gaussian whose variance is set by its maximal sampling rate $\hat\nu_k$. Convolving two Gaussians just adds their covariances, so this is free: $\Sigma_k \leftarrow \Sigma_k + \tfrac{s}{\hat\nu_k^2} I$. It then replaces the dilation with a <b>2D Mip filter</b> that approximates the true pixel box filter. The consequence is dramatic and easy to measure:</p>
+
+<figure class="chart" data-chart='{"title":"Train at full resolution, render smaller (zoom out): Blender, PSNR","unit":" dB","x":["full res","1/2","1/4","1/8"],"series":[{"name":"3DGS","values":[33.33,26.95,21.38,17.69]},{"name":"3DGS + EWA filter","values":[33.51,31.66,27.82,24.63]},{"name":"Mip-Splatting","values":[33.36,34.00,31.85,28.67]}]}'>
+<figcaption>Table 2 of <a class="paper" data-paper="CVPR20241019">Mip-Splatting</a>, read from its OCR. All three methods are equal at the training scale. 3DGS loses 15.6 dB by 1/8 resolution; Mip-Splatting loses 4.7. The same paper shows the reverse (zoom-in) on Mip-NeRF 360: 3DGS falls from 29.19 to 19.59 dB at 8×, Mip-Splatting from 29.39 to 26.22.</figcaption>
+</figure>
+
+<p><b>Density control.</b> The second fidelity problem is where Gaussians go. <a class="paper" data-paper="NEURIPS20242572">3DGS-MCMC</a> makes the cleanest conceptual move. It notices that the 3DGS update is almost exactly Stochastic Gradient Langevin Dynamics, an MCMC sampler, minus the noise term. So it treats the Gaussians as samples from a distribution that favours good reconstructions, adds position noise shaped by each Gaussian's own covariance (gated so opaque Gaussians barely move), and replaces clone/split/prune with "relocation": dead Gaussians are teleported onto live ones, with parameters adjusted so the image is unchanged. The count becomes a user-set budget instead of an accident of thresholds. By 2026 the same question gets learned answers. <a class="paper" data-paper="ICML20263465">LeGS</a> trains an RL policy per Gaussian, with a reward from how much the rendering error changes when that Gaussian is removed, computed in closed form.</p>
+
+<p><b>The primitive and the renderer.</b> The third thread questions the Gaussian and the rasteriser themselves. <a class="paper" data-paper="CVPR20251618">Textured Gaussians</a> give each Gaussian a small texture map, so one primitive can carry more than one colour; at 10% of the Gaussians it holds 26.32 dB on Mip-NeRF 360 vs 25.77 for 3DGS. <a class="paper" data-paper="CVPR20263765">Jinc kernels</a> treat the kernel as a low-pass filter and derive a closer-to-ideal one. <a class="paper" data-paper="ICCV20251851">EVER</a> replaces the blobs with constant-density ellipsoids and <b>ray-traces</b> them, so compositing is exact and nothing pops. The cost is large: 36 vs 224 FPS on Mip-NeRF 360 in its note. <a class="paper" data-paper="CVPR20263296">Stochastic ray tracing</a> attacks that cost. Per sample it picks one Gaussian with probability equal to its blending weight, which gives an unbiased, sort-free estimator. It reaches 28.31 dB on Mip-NeRF 360 in 33 min vs 3DGRT's 28.40 in 69 min.</p>
+
+<div class="callout opinion">
+<p>The fidelity line is converging on an uncomfortable conclusion: the speed of 3DGS came from approximations (one sort per image, affine projection, no extent along the ray) that matter for exactly the cases people now care about. Those are reflections, wide-angle and fisheye cameras, relighting and zoom. I expect a two-tier world: rasterised Gaussians for real-time viewing, and a ray-traced or exact-integration variant of the <i>same</i> primitives for training and for effects. Stochastic estimators look like the most promising bridge.</p>
+</div>
+
+<!-- ------------------------------------------------------------------ -->
+<h3 id="compact">2 · Compact and fast</h3>
+<p><b>The problem</b> is in the 59 floats. A typical outdoor scene ends up with a few million Gaussians, and $3\text{M} \times 59 \times 4$ bytes $\approx$ 0.7 GB. Mip-NeRF 360 scenes average 734 MB in <a class="paper" data-paper="NEURIPS20244446">LightGaussian</a>'s table and about 1.4 GB for its Bicycle scene. That is too much to stream to a phone or a browser, and many of those Gaussians contribute almost nothing.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 264" role="img" aria-label="One Gaussian's 59 floats: position 3, scale 3, rotation 4, opacity 1, spherical harmonics 48. Each compression strategy attacks a different part: pruning removes rows, SH distillation and codebooks shrink the 48, entropy coding and anchors exploit redundancy between Gaussians.">
+  <text x="40" y="24" class="ttl">One Gaussian = 59 float32 = 236 bytes</text>
+  <g stroke="var(--card)" stroke-width="1">
+    <rect x="40" y="36" width="31.5" height="34" fill="var(--s1)"/>
+    <rect x="71.5" y="36" width="31.5" height="34" fill="var(--s3)"/>
+    <rect x="103" y="36" width="42" height="34" fill="var(--s4)"/>
+    <rect x="145" y="36" width="10.5" height="34" fill="var(--s5)"/>
+    <rect x="155.5" y="36" width="504.5" height="34" fill="var(--s2)" fill-opacity=".85"/>
+  </g>
+  <g class="sm" text-anchor="middle"><text x="55.7" y="88">μ 3</text><text x="87.2" y="88">s 3</text><text x="124" y="88">q 4</text><text x="150" y="104">o 1</text><text x="408" y="58" style="fill:var(--bg)">spherical harmonics, degree 3: 48 (81% of the bytes)</text></g>
+  <!-- rows of gaussians -->
+  <g>
+    <rect x="40" y="120" width="560" height="14" rx="3" fill="var(--soft)" stroke="var(--line)"/>
+    <rect x="40" y="140" width="560" height="14" rx="3" fill="var(--soft)" stroke="var(--line)"/>
+    <rect x="40" y="160" width="560" height="14" rx="3" fill="var(--soft)" stroke="var(--line)" opacity=".5"/>
+    <line x1="40" y1="167" x2="600" y2="167" stroke="var(--bad)" stroke-width="2"/>
+    <rect x="40" y="180" width="560" height="14" rx="3" fill="var(--soft)" stroke="var(--line)"/>
+    <text x="610" y="171" class="sm" style="fill:var(--bad)">pruned</text>
+    <text x="610" y="191" class="sm" style="fill:var(--muted)">× millions</text>
+  </g>
+  <g class="sm">
+    <text x="40" y="218">① prune rows: LightGaussian, Mini-Splatting, Speedy-Splat</text>
+    <text x="40" y="236">② shrink the 48: SH distillation, codebooks, hash-grid colour (LightGaussian, Compact 3DGS)</text>
+    <text x="40" y="254">③ code the redundancy between neighbours: anchors (Scaffold-GS), context models (HAC)</text>
+  </g>
+</svg>
+<figcaption><b>Where the bytes go, and what each strategy attacks.</b> The 59-float layout follows from Steps 2–3. About 81% of a Gaussian is view-dependent colour, which is why nearly every compression paper starts there.</figcaption>
+</figure>
+
+<p><b>The key insight</b> is that the representation is massively redundant in three different ways, and each redundancy calls for a different tool. <i>Too many rows:</i> most Gaussians are nearly transparent or hidden. <a class="paper" data-paper="NEURIPS20244446">LightGaussian</a> scores each one by how much it contributes across all training views and prunes the bottom, and <a class="paper" data-paper="ECCV20242056">Mini-Splatting</a> keeps only Gaussians that are the top contributor to at least one pixel. <i>Too many columns:</i> most Gaussians do not need degree-3 SH. LightGaussian distils SH to degree 2 and vector-quantises the rest; <a class="paper" data-paper="CVPR20242275">Compact 3DGS</a> replaces per-Gaussian SH with a hash grid queried by position. <i>Correlated neighbours:</i> nearby Gaussians look alike. <a class="paper" data-paper="CVPR20242478">Scaffold-GS</a> generates Gaussians from a sparse set of anchors with small MLPs (171 MB vs 721 MB on Mip-NeRF 360), and <a class="paper" data-paper="ECCV20240185">HAC</a> adds an entropy model conditioned on a hash grid, so the anchors themselves are arithmetic-coded. Its note reports over 75× compression vs 3DGS.</p>
+<p>The numbers moved fast. LightGaussian gets to 45 MB at 27.13 dB (vs 782 MB, 27.40 for its retrained 3DGS). <a class="paper" data-paper="NEURIPS20254534">OMG</a> reaches 4.06 MB at 27.06 dB with 0.43M Gaussians. <a class="paper" data-paper="ECCV20261811">KISS-GS</a> reports 228× reduction on Mip-NeRF 360 at matched quality, in a deliberately modular "image codec" pipeline. Speed follows from fewer Gaussians. <a class="paper" data-paper="CVPR20251482">Speedy-Splat</a> renders at 898 vs 134 FPS (with a small PSNR loss, 26.94 vs 27.55), and <a class="paper" data-paper="CVPR20262382">FastGS</a> trains a Mip-NeRF 360 scene in 1.93 min vs 20.93 min for 3DGS.</p>
+<div class="callout warn">
+<p>Every paper retrains its own 3DGS baseline, so the "3DGS" row on Mip-NeRF 360 varies from 27.21 to 29.30 dB across the notes read for this primer, and from 97 to 224 FPS. Compare each method with the 3DGS row <i>in its own table</i>, never across papers.</p>
+</div>
+
+<!-- ------------------------------------------------------------------ -->
+<h3 id="surfaces">3 · Surfaces and geometry</h3>
+<p><b>The problem.</b> 3DGS is optimised to make <i>images</i> right, not geometry. A shiny floor can be faked by a cloud of Gaussians floating below it, which reproduce the reflection, and the image loss is perfectly happy. If you want a mesh (for simulation, games, measurement), the Gaussians do not define one. A 3D blob also has no well-defined depth along a ray (where inside the blob is the surface?) and no well-defined normal.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 230" role="img" aria-label="Left: a ray through a 3D Gaussian blob passes through a spread-out density, so depth and normal are ambiguous. Right: a ray hits a flat 2D Gaussian disk at one point, which gives an exact depth and a normal.">
+  <defs><marker id="arD" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+  <radialGradient id="blobg"><stop offset="0" stop-color="var(--s1)" stop-opacity=".7"/><stop offset="1" stop-color="var(--s1)" stop-opacity="0"/></radialGradient></defs>
+  <text x="20" y="22" class="ttl">3D Gaussian (volume)</text>
+  <ellipse cx="190" cy="110" rx="90" ry="55" fill="url(#blobg)"/>
+  <line x1="20" y1="110" x2="330" y2="110" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#arD)"/>
+  <path d="M100,185 C140,185 160,150 190,150 C220,150 240,185 280,185" fill="none" stroke="var(--s2)" stroke-width="2"/>
+  <line x1="100" y1="185" x2="280" y2="185" stroke="var(--muted)"/>
+  <text x="190" y="205" text-anchor="middle" class="sm">density along the ray: a spread, not a point</text>
+  <text x="190" y="222" text-anchor="middle" class="sm" style="fill:var(--muted)">depth = ? · normal = ?</text>
+  <line x1="350" y1="20" x2="350" y2="220" stroke="var(--line)"/>
+  <text x="372" y="22" class="ttl">2D Gaussian surfel (disk)</text>
+  <ellipse cx="540" cy="110" rx="70" ry="12" transform="rotate(-62 540 110)" fill="var(--s3)" fill-opacity=".45" stroke="var(--s3)" stroke-width="1.5"/>
+  <line x1="372" y1="110" x2="680" y2="110" stroke="var(--fg)" stroke-width="1.5" marker-end="url(#arD)"/>
+  <circle cx="540" cy="110" r="5" fill="var(--s2)"/>
+  <line x1="540" y1="110" x2="502" y2="90" stroke="var(--s3)" stroke-width="2.4" marker-end="url(#arD)"/>
+  <text x="470" y="80" class="sm" style="fill:var(--s3)">normal n</text>
+  <text x="552" y="132" class="sm" style="fill:var(--s2)">one intersection</text>
+  <text x="540" y="205" text-anchor="middle" class="sm">ray–disk hit: exact depth, explicit normal</text>
+  <text x="540" y="222" text-anchor="middle" class="sm" style="fill:var(--muted)">(2DGS, SIGGRAPH 2024; Gaussian surfels)</text>
+</svg>
+<figcaption><b>Why the surface line flattened the Gaussians.</b> Collapse one axis of the ellipsoid and the primitive becomes a disk with a normal. 2D Gaussian Splatting (outside the vault, built on by 104 topic papers) renders disks by ray–disk intersection instead of affine projection.</figcaption>
+</figure>
+
+<p><b>The key insight</b> is to make the primitives agree on a surface: flatten them, align them, then extract. <a class="paper" data-paper="CVPR20242220">SuGaR</a> did it first. A regulariser pushes Gaussians to be flat, opaque and spread along the surface, then it samples a level set and runs Poisson reconstruction, cutting mesh extraction "from 24+ hours" for SDF methods to 5–10 minutes. 2DGS made flatness the primitive itself (figure above). Then the field split. <a class="paper" data-paper="ECCV20242381">GS2Mesh</a> ignores the Gaussians' positions entirely. It renders stereo pairs from the trained scene, runs a pretrained stereo network, and fuses the depths, reaching 0.68 mm Chamfer on DTU. <a class="paper" data-paper="CVPR20252072">Geometry Field Splatting</a> gives surfels a principled stochastic-geometry definition with near-exact rendering, at 0.58 mm.</p>
+
+<figure class="paperfig">
+<img src="figs/sugar-composite.webp" alt="A garden scene with a reconstructed Lego bulldozer and a figurine composited into it." loading="lazy">
+<figcaption>Figure 1 of <a class="paper" data-paper="CVPR20242220">SuGaR</a>: meshes extracted from 3DGS scenes are edited (the robot's posture was changed) and composited into another captured scene. Getting a <i>usable mesh</i> out of Gaussians is the payoff this sub-area chases.</figcaption>
+</figure>
+
+<p>By 2026 the DTU Chamfer race has reached about 0.46 mm (<a class="paper" data-paper="ICML20262652">AmbiSuR</a>, 0.46; <a class="paper" data-paper="NEURIPS20253629">GeoSVR</a>, 0.47). The gains now come from diagnosing <i>where</i> photometry is ambiguous rather than from new primitives. AmbiSuR flags primitives whose high-degree SH energy is large: if a Gaussian needs strong view-dependence to fit, its geometry is probably wrong. GeoSVR is worth noticing for another reason: it does this with <b>sparse voxels</b>, not Gaussians, and argues that voxels' sharp boundaries suit geometry better.</p>
+<div class="callout opinion">
+<p>The tension here is real and unresolved. Every regulariser that makes Gaussians more surface-like costs some image quality (SuGaR's refined model: 27.27 dB vs 28.69 for vanilla 3DGS in its note), because the volumetric fuzz is what fakes hair, foliage and reflections. My bet is that the winning recipe keeps two populations, surface-bound primitives and free volumetric ones, rather than forcing one primitive to do both.</p>
+</div>
+
+<!-- ------------------------------------------------------------------ -->
+<h3 id="dynamic">4 · Time: dynamic scenes and avatars</h3>
+<p><b>The problem.</b> Real scenes move. Storing a separate set of Gaussians per frame costs $O(T\cdot N)$ memory and has no notion that it is the <i>same</i> object moving, so it cannot fill in a region occluded in one frame from another frame.</p>
+<p><b>Two templates</b> appeared at once in 2024, and the field still lives between them.</p>
+<div class="compare">
+<div><h4>Canonical space + deformation</h4><p class="small">Keep one set of Gaussians in a "canonical" (rest) pose. A network maps (Gaussian centre, time) to offsets in position, rotation and scale. <a class="paper" data-paper="CVPR20242189">Deformable 3DGS</a> uses an 8-layer MLP. <a class="paper" data-paper="CVPR20240949">4DGS</a> (Wu et al.) uses a factorised HexPlane grid plus a tiny MLP: 82 FPS, 18 MB on D-NeRF. <a class="paper" data-paper="CVPR20241842">SC-GS</a> drives Gaussians from a few hundred control points by skinning, which makes motion low-dimensional and editable.</p></div>
+<div><h4>Native space-time primitives</h4><p class="small">Make each primitive itself live in time. <a class="paper" data-paper="ICLR20240365">4DGS</a> (Yang et al.) uses true 4D Gaussians over $(x,y,z,t)$ and <i>slices</i> them at the render time (widget below). <a class="paper" data-paper="CVPR20242666">Spacetime Gaussians</a> give each Gaussian a temporal opacity bump and a polynomial trajectory. <a class="paper" data-paper="CVPR20252768">FreeTimeGS</a> gives each a lifetime and a velocity, with no canonical space at all.</p></div>
+</div>
+
+<p>The slicing idea is the elegant one, so let's see it work. A 4D Gaussian has a 4×4 covariance. Condition it on a time $t$, using the standard Gaussian conditioning formulas, and you get an ordinary 3D Gaussian plus a scalar weight:</p>
+$$\boldsymbol\mu_{xyz\mid t} = \boldsymbol\mu_{1:3} + \Sigma_{1:3,4}\,\Sigma_{4,4}^{-1}(t-\mu_t),\qquad \Sigma_{xyz\mid t} = \Sigma_{1:3,1:3} - \Sigma_{1:3,4}\Sigma_{4,4}^{-1}\Sigma_{4,1:3},\qquad p(t)=\mathcal N(t;\mu_t,\Sigma_{4,4}).$$
+<p>In words: the off-diagonal block $\Sigma_{1:3,4}$, the <b>tilt</b> of the ellipsoid in space-time, acts as a <b>velocity</b>. The slice's centre slides linearly as $t$ changes. The marginal $p(t)$ makes the primitive fade in and out around its time $\mu_t$, and it multiplies the opacity in the compositing sum. In the paper's notation the effective alpha is $p_i(t)\,p_i(u,v\mid t)\,\alpha_i$, and Gaussians with $p(t)\lt 0.05$ are skipped (from its OCR). Motion falls out of geometry; there is no deformation network.</p>
+
+<figure class="widget">
+<svg id="slice" viewBox="0 0 700 320" role="img" aria-label="A tilted 2D Gaussian in the time-space plane is sliced at a chosen time; the slice is a 1D Gaussian whose centre moves with the tilt and whose weight fades away from the Gaussian's time."></svg>
+<div class="controls" id="slicec"></div>
+<div class="readout" id="slicer"></div>
+<figcaption><b>Slicing a space-time Gaussian</b> (one space axis $x$ instead of three). Left: the primitive in the $(t,x)$ plane and the vertical slice at the render time. Right: what the rasteriser receives at that time, a 1D Gaussian with conditional mean $\mu_{x|t}$, scaled by $p(t)$. The <i>velocity</i> slider is the tilt $\Sigma_{xt}/\Sigma_{tt}$; <i>lifetime</i> is $\sqrt{\Sigma_{tt}}$.</figcaption>
+</figure>
+
+<figure class="paperfig">
+<img src="figs/4dgs-conditioning.webp" alt="Schematic: 4D Gaussians are conditioned on time to give 3D Gaussians, which are splatted to 2D Gaussians and blended into an image." loading="lazy">
+<figcaption>Figure 1 of <a class="paper" data-paper="ICLR20240365">4DGS</a> (Yang et al.): the same two operations as the widget. <i>Condition</i> a 4D Gaussian on time to get a 3D one, then <i>splat</i> it as in static 3DGS. Read the top row as the analogy: sampling a dynamic scene at one instant gives a static scene.</figcaption>
+</figure>
+
+<p><b>Where it went.</b> Multi-view studio capture is now largely solved at real-time rates. FreeTimeGS reports 33.19 dB on Neural3DV at about 460 FPS. The hard frontier is <b>casual monocular video</b>: one moving phone, so every point is seen from roughly one direction at each instant. That is badly under-constrained, and the 2025 answers import priors. <a class="paper" data-paper="ICCV20251580">Shape of Motion</a> expresses every Gaussian's motion as a blend of 10 shared rigid motions initialised from noisy 2D tracks and depth. <a class="paper" data-paper="CVPR20252444">MoSca</a> builds a sparse graph of rigid "scaffold" trajectories and does without known poses. The 2026 step is to drop per-scene optimisation here too. <a class="paper" data-paper="CVPR20261737">MoVieS</a> predicts per-pixel dynamic Gaussians from a VGGT backbone in 0.93 s instead of 10–45 min. The numbers stay sobering: on DyCheck, mPSNR is still in the 14–19 dB range across these notes.</p>
+<p><b>Avatars</b> are the special case where you know the moving thing's skeleton. <a class="paper" data-paper="CVPR20241188">GaussianAvatars</a> binds each Gaussian to a triangle of the FLAME face mesh, in that triangle's local frame, so the Gaussians follow the animated mesh. Two years later, <a class="paper" data-paper="ICCV20251202">LHM</a> produces an animatable full-body Gaussian avatar from a single image in seconds (6.57 s vs 15 min), trained on in-the-wild video. The same shift from optimisation to prediction shows up across this whole topic.</p>
+
+<!-- ------------------------------------------------------------------ -->
+<h3 id="feedforward">5 · Feed-forward reconstruction: predicting the Gaussians</h3>
+<p><b>The problem.</b> Per-scene optimisation needs dozens of posed images and minutes of GPU time per scene, and it learns nothing across scenes. Could a network look at two or a few photos and output the Gaussians directly, in one forward pass?</p>
+<p><b>The key insight</b> is <b>pixel-aligned Gaussians</b>. Do not predict "a set of Gaussians somewhere in space"; that is a hard set-prediction problem. Predict <i>one Gaussian per input pixel</i>, placed along that pixel's ray at a predicted depth. The network becomes an image-to-image model, a U-Net or ViT outputting a few channels per pixel, which deep learning is very good at. 3D structure enters only through the unprojection $\boldsymbol\mu = \mathbf o + d\,\mathbf r$ (camera centre plus depth times ray direction).</p>
+
+<figure class="diagram bleed">
+<svg viewBox="0 0 780 230" role="img" aria-label="Two input images with poses go through an encoder with cross-view attention or a cost volume; a per-pixel head outputs depth, covariance, opacity and colour; unprojection gives two times H times W Gaussians, which are splatted into a target view and compared with the real image during training.">
+  <defs><marker id="arE" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+        <marker id="arE2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--s2)"/></marker></defs>
+  <g fill="var(--soft)" stroke="var(--fg)" stroke-width="1.2"><rect x="10" y="40" width="70" height="52" rx="4"/><rect x="20" y="100" width="70" height="52" rx="4"/></g>
+  <text x="50" y="176" text-anchor="middle" class="sm">2 × (H×W×3)</text><text x="50" y="192" text-anchor="middle" class="sm" style="fill:var(--muted)">+ poses (or not)</text>
+  <rect x="120" y="50" width="150" height="92" rx="10" fill="var(--card)" stroke="var(--fg)" stroke-width="1.4"/>
+  <text x="195" y="76" text-anchor="middle" class="ttl">Encoder</text>
+  <text x="195" y="98" text-anchor="middle" class="sm">cross-view attention</text><text x="195" y="114" text-anchor="middle" class="sm">or plane-sweep</text><text x="195" y="130" text-anchor="middle" class="sm">cost volume</text>
+  <rect x="300" y="50" width="160" height="92" rx="10" fill="var(--card)" stroke="var(--fg)" stroke-width="1.4"/>
+  <text x="380" y="76" text-anchor="middle" class="ttl">Per-pixel head</text>
+  <text x="380" y="98" text-anchor="middle" class="sm mono">depth d (1)</text><text x="380" y="114" text-anchor="middle" class="sm mono">s,q (7) · α (1)</text><text x="380" y="130" text-anchor="middle" class="sm mono">colour/SH (3+)</text>
+  <rect x="490" y="50" width="130" height="92" rx="10" fill="var(--card)" stroke="var(--fg)" stroke-width="1.4"/>
+  <text x="555" y="76" text-anchor="middle" class="ttl">Unproject</text>
+  <text x="555" y="98" text-anchor="middle" class="sm mono">μ = o + d·r</text><text x="555" y="114" text-anchor="middle" class="sm">2·H·W Gaussians</text><text x="555" y="130" text-anchor="middle" class="sm" style="fill:var(--muted)">in one pass</text>
+  <rect x="650" y="50" width="120" height="92" rx="10" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.4"/>
+  <text x="710" y="76" text-anchor="middle" class="ttl">Splat</text>
+  <text x="710" y="98" text-anchor="middle" class="sm">render any</text><text x="710" y="114" text-anchor="middle" class="sm">target view</text><text x="710" y="130" text-anchor="middle" class="sm" style="fill:var(--muted)">(real time)</text>
+  <g stroke="var(--fg)" stroke-width="1.4"><line x1="92" y1="96" x2="118" y2="96" marker-end="url(#arE)"/><line x1="270" y1="96" x2="298" y2="96" marker-end="url(#arE)"/><line x1="460" y1="96" x2="488" y2="96" marker-end="url(#arE)"/><line x1="620" y1="96" x2="648" y2="96" marker-end="url(#arE)"/></g>
+  <path d="M710,142 L710,196 L195,196 L195,144" fill="none" stroke="var(--s2)" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arE2)"/>
+  <text x="452" y="218" text-anchor="middle" class="lbl" style="fill:var(--s2)">training only: photometric loss on held-out target views, across thousands of scenes</text>
+</svg>
+<figcaption><b>The pixel-aligned recipe</b> shared by pixelSplat, MVSplat, DepthSplat, GS-LRM and their successors. They differ mainly in how the encoder finds depth, which is the hard part.</figcaption>
+</figure>
+
+<p>Depth is where it gets interesting. Recall the local-minima problem from Step 6: a Gaussian put at the wrong depth gets no useful gradient. <a class="paper" data-paper="CVPR20241339">pixelSplat</a>'s answer is to predict a <b>probability distribution</b> over depth buckets for each pixel, <i>sample</i> a depth, and set the Gaussian's opacity equal to that depth's probability: $\boldsymbol\mu=\mathbf o+(b_z+\delta_z)\mathbf d$, $\alpha=\phi_z$. When the sampled depth is right, the loss pushes opacity up, which raises that depth's probability. Gradients reach the depth distribution through the opacity: a reparameterisation trick "inspired by variational autoencoders" (from its OCR). It is worth about 1 dB.</p>
+
+<figure class="paperfig">
+<img src="figs/pixelsplat-method.webp" alt="pixelSplat: per-pixel features produce depth distributions; a depth is sampled per pixel, the Gaussian is placed along the ray, and its opacity is the sampled bucket's probability." loading="lazy">
+<figcaption>Figure 3 of <a class="paper" data-paper="CVPR20241339">pixelSplat</a>. For three pixels (red, blue, green), the network outputs a depth histogram $p_\phi(z)$. One bucket is sampled; the Gaussian goes at that depth along the pixel's ray, with opacity = the bucket's probability. Look at the middle panel: this is how a network learns depth without depth supervision.</figcaption>
+</figure>
+
+<p>The line then followed the classical stereo playbook. <a class="paper" data-paper="ECCV20240557">MVSplat</a> replaced the learned histogram with a plane-sweep <b>cost volume</b> (test 128 depth hypotheses by warping features between views and measuring agreement), at 10× fewer parameters than pixelSplat. <a class="paper" data-paper="CVPR20252439">DepthSplat</a> added a frozen monocular depth model for regions matching cannot handle. <a class="paper" data-paper="ECCV20240564">GS-LRM</a> showed that a plain 300M transformer over image patches plus per-pixel ray embeddings works too: 28.10 dB on RealEstate10K. <a class="paper" data-paper="ICCV20252484">Long-LRM</a> scales to 32 high-resolution views in 1 s, beating per-scene 3DGS that took 13 minutes on DL3DV (24.10 vs 23.60 dB).</p>
+<p><b>Then the poses went.</b> <a class="paper" data-paper="ICLR20251940">NoPoSplat</a> predicts all Gaussians directly in the first camera's coordinate frame, so no poses are needed at all, and beats pose-requiring MVSplat when views overlap little (22.51 vs 20.35 dB). From there the natural backbone is a <b>geometry foundation model</b>. <a class="paper" data-paper="CVPR20250750">VGGT</a> predicts cameras, depth and point maps for up to hundreds of views in a fraction of a second. 2026 feed-forward Gaussian models are mostly VGGT-style trunks with Gaussian heads: <a class="paper" data-paper="ICLR20261363">YoNoSplat</a>, <a class="paper" data-paper="ICML20262881">WorldMirror</a>, <a class="paper" data-paper="CVPR20262098">Off The Grid</a>.</p>
+
+<figure class="chart" data-chart='{"title":"Share of 3DGS papers that are feed-forward / pose-free (within the topic)","unit":"%","x":["2024","2025","2026"],"series":[{"name":"CVPR","values":[5.97,12.71,21.80]},{"name":"ECCV","values":[10.19,null,18.54]},{"name":"ICCV","values":[null,15.60,null]},{"name":"NeurIPS","values":[11.11,18.02,null]},{"name":"ICLR","values":[null,12.90,25.64]}]}'>
+<figcaption>Query <code>{title key_contribution}: ("feed-forward" OR feedforward OR generalizable OR "large reconstruction model" OR pose-free OR unposed OR "image pairs")</code> within the topic (<code>trend --within</code>); precision about 8/10 on a 10-paper sample. ICLR 2024 is omitted (3 topic papers). The fastest-growing sub-area: from about 1 in 17 CVPR 3DGS papers to about 1 in 5.</figcaption>
+</figure>
+
+<p>Two 2026 corrections are worth knowing. First, one-Gaussian-per-pixel is <b>wasteful</b>. Add views and the count grows linearly, mostly duplicating surfaces. <a class="paper" data-paper="ECCV20262102">GlobalSplat</a> decodes a fixed budget of Gaussians from 2,048 latent scene tokens, matching a pixel-aligned baseline with 16K instead of 393K Gaussians. <a class="paper" data-paper="CVPR20262098">Off The Grid</a> <i>detects</i> Gaussians at sub-pixel positions with about 86% fewer primitives. Second, the representation itself is being questioned. <a class="paper" data-paper="ICLR20252162">LVSM</a> drops 3D entirely: a transformer maps input images and target-camera rays straight to target pixels. It beats GS-LRM on RealEstate10K (29.67 vs 28.10 dB) but has no explicit 3D, no real-time splat rendering, and noisy, flickering unseen regions.</p>
+<div class="callout opinion">
+<p>I read LVSM as the strongest argument <i>for</i> Gaussians, not against them. When the target is "a pretty image from nearby", a 3D bottleneck is a handicap. When the target is anything downstream (edit it, simulate it, render it at 200 FPS on a headset, keep it consistent for a minute of video), you want an explicit, cheap-to-render 3D state. The likely end point is a geometry foundation model that outputs Gaussians as one of several heads, and that is already where WorldMirror is.</p>
+</div>
+
+<!-- ------------------------------------------------------------------ -->
+<h3 id="substrate">6 · Gaussians as a general 3D substrate: generation, semantics, SLAM, physics</h3>
+<p><b>The idea.</b> Once a scene is a list of primitives, you can attach <i>any</i> attribute to each primitive and render it with the same rasteriser. Replace RGB by a feature vector and you render a feature map. Replace the update rule by a physics simulator and the scene moves. Most of the 1,486 topic papers are of this kind: they take 3DGS as the substrate and do something else with it.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 270" role="img" aria-label="A central Gaussian with its base attributes; spokes show attributes attached by other lines of work: language features, identity codes, material-point physics state, camera-pose gradients for SLAM, time for 4D, and generator outputs.">
+  <ellipse cx="350" cy="135" rx="80" ry="44" transform="rotate(-15 350 135)" fill="var(--s1)" fill-opacity=".18" stroke="var(--s1)" stroke-width="2"/>
+  <text x="350" y="130" text-anchor="middle" class="ttl">one Gaussian</text>
+  <text x="350" y="149" text-anchor="middle" class="sm mono">μ, Σ, o, SH</text>
+  <g stroke="var(--line)" stroke-width="1.5">
+    <line x1="290" y1="110" x2="190" y2="50"/><line x1="410" y1="110" x2="510" y2="50"/>
+    <line x1="270" y1="140" x2="150" y2="140"/><line x1="430" y1="140" x2="550" y2="140"/>
+    <line x1="300" y1="168" x2="190" y2="225"/><line x1="400" y1="168" x2="510" y2="225"/>
+  </g>
+  <g fill="var(--card)" stroke="var(--line)">
+    <rect x="20" y="28" width="210" height="44" rx="8"/><rect x="470" y="28" width="210" height="44" rx="8"/>
+    <rect x="20" y="118" width="130" height="44" rx="8"/><rect x="550" y="118" width="130" height="44" rx="8"/>
+    <rect x="20" y="204" width="210" height="44" rx="8"/><rect x="470" y="204" width="210" height="44" rx="8"/>
+  </g>
+  <g class="sm">
+    <text x="30" y="46" style="fill:var(--s2)">+ language feature (3-d)</text><text x="30" y="63">LangSplat: CLIP → 3-d latent</text>
+    <text x="480" y="46" style="fill:var(--s3)">+ identity code (16-d)</text><text x="480" y="63">Gaussian Grouping: SAM masks</text>
+    <text x="30" y="136" style="fill:var(--s4)">+ time / velocity</text><text x="30" y="153">4DGS, FreeTimeGS</text>
+    <text x="560" y="136" style="fill:var(--s5)">+ camera pose ∂</text><text x="560" y="153">SplaTAM, GS-SLAM</text>
+    <text x="30" y="222" style="fill:var(--s6)">+ material-point state</text><text x="30" y="239">PhysGaussian: Σ ← F Σ Fᵀ</text>
+    <text x="480" y="222" style="fill:var(--accent)">= output of a generator</text><text x="480" y="239">DreamGaussian, LGM, TRELLIS</text>
+  </g>
+</svg>
+<figcaption><b>The attribute-container view.</b> Each spoke is a line of work that attaches something to the same primitive and reuses the rasteriser, or makes the primitive the output of something else.</figcaption>
+</figure>
+
+<p><b>Semantics.</b> <a class="paper" data-paper="CVPR20240858">LangSplat</a> attaches a language feature to each Gaussian, so you can query a 3D scene with text. CLIP features are 512-d and you cannot rasterise 512 channels for millions of Gaussians, so it trains a per-scene autoencoder down to 3 dimensions. Queries become 199× faster than the NeRF-based LERF. <a class="paper" data-paper="ECCV20240762">Gaussian Grouping</a> attaches a 16-d identity code supervised by SAM masks, and editing becomes "select the group, change only those Gaussians". The recurring cost, visible in every such note, is dimensionality: features have to be squeezed to fit through the rasteriser.</p>
+<p><b>SLAM.</b> Explicit primitives give analytic gradients of the image with respect to the camera pose. <a class="paper" data-paper="CVPR20240557">Gaussian Splatting SLAM</a> derives them on the Lie group and runs tracking and mapping as gradient descent on one Gaussian map, with a convergence basin it measures as much wider than hash-grid or MLP maps. <a class="paper" data-paper="CVPR20241810">SplaTAM</a> uses a rendered silhouette to know which pixels the map already explains, which tells it where to add Gaussians.</p>
+<p><b>Physics.</b> <a class="paper" data-paper="CVPR20241250">PhysGaussian</a> treats every Gaussian as a particle of the Material Point Method. The simulator's local deformation gradient $F$ updates the covariance as $F\Sigma F^\top$, a Gaussian stays a Gaussian under a local linear map, so what you simulate is exactly what you render. No mesh is needed in between.</p>
+<p><b>Generation.</b> <a class="paper" data-paper="ICLR20241330">DreamGaussian</a> optimised Gaussians under score distillation from a 2D diffusion model (image-to-3D in about 2 minutes). <a class="paper" data-paper="ECCV20240081">LGM</a> made it feed-forward: one Gaussian per output pixel of a multi-view U-Net. <a class="paper" data-paper="CVPR20250184">TRELLIS</a>, the most built-upon recent paper in the topic (120 vault papers cite it), generates a sparse structured latent that decodes to Gaussians, radiance fields <i>or</i> meshes. Gaussians are one output format among several. Going the other way, <a class="paper" data-paper="CVPR20251147">Difix3D+</a> uses a single-step diffusion model to clean up 3DGS renders in poorly observed regions and distils the fixes back into the scene.</p>
+<div class="callout opinion">
+<p>This spread is the real legacy of 3DGS. The rasteriser became a general differentiable "3D → 2D" operator for arbitrary per-primitive attributes. It is also why the topic is so large and so incremental: a big share of these papers are "X, but with Gaussians". When you read one, ask what it would lose if the Gaussians were replaced by points or voxels. Often the honest answer is "speed only".</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="benchmarks">Benchmarks and baselines</h2>
+<p>What the topic evaluates on, counted over the 1,486 topic papers (<code>datasets_evaluated_on</code> tags, spelling variants merged):</p>
+<table>
+<thead><tr><th>Dataset</th><th class="num">papers</th><th>What it measures</th><th>Blind spot (my judgement)</th></tr></thead>
+<tbody>
+<tr><td>Mip-NeRF 360</td><td class="num">296</td><td>9 unbounded indoor/outdoor scenes, 360° captures, ~100–300 photos each</td><td>dense, careful capture; tests interpolation between nearby views, not extrapolation</td></tr>
+<tr><td>Tanks and Temples</td><td class="num">222</td><td>large real scenes; NVS and (with GT scans) surface F1</td><td>only a few scenes are used for NVS; same dense-capture bias</td></tr>
+<tr><td>Deep Blending</td><td class="num">129</td><td>indoor scenes with view-dependent effects</td><td>2 scenes in common use</td></tr>
+<tr><td>DTU</td><td class="num">101</td><td>tabletop objects with structured-light GT; Chamfer distance for surfaces</td><td>controlled lighting, small objects; saturating near 0.46 mm</td></tr>
+<tr><td>LLFF</td><td class="num">91</td><td>forward-facing phone captures; standard for sparse-view (3 views)</td><td>small baseline, low resolution</td></tr>
+<tr><td>RealEstate10K / ACID</td><td class="num">75 / 42</td><td>YouTube walkthroughs; the feed-forward benchmark</td><td>256×256 is still common; mostly small camera motion between context views</td></tr>
+<tr><td>ScanNet, ScanNet++, Replica</td><td class="num">74 / 55 / 67</td><td>indoor RGB-D; SLAM and semantics</td><td>Replica is synthetic, so SLAM numbers on it saturate</td></tr>
+<tr><td>NeRF-Synthetic (Blender)</td><td class="num">48 + 40</td><td>8 synthetic objects; also used multi-scale for aliasing</td><td>tagged under two names; trivially easy for modern methods</td></tr>
+<tr><td>DL3DV</td><td class="num">46</td><td>10K diverse real scenes; large-scale training and evaluation for feed-forward models</td><td>newer, so fewer comparable numbers</td></tr>
+<tr><td>D-NeRF, HyperNeRF, DyCheck (iPhone)</td><td class="num">41 / 40 / –</td><td>dynamic scenes; DyCheck is the honest monocular one</td><td>D-NeRF is synthetic, with teleporting cameras that make it easier than real monocular video</td></tr>
+</tbody></table>
+<p>And what papers compare against (<code>compares_to</code>, top 10): the original 3DGS (409 papers), <a class="paper" data-paper="CVPR20240949">4DGS</a> (100), 2DGS (89), Instant-NGP (78), <a class="paper" data-paper="ECCV20240557">MVSplat</a> (72), Mip-NeRF 360 (68), <a class="paper" data-paper="CVPR20242189">Deformable 3DGS</a> (66), NeRF (62), <a class="paper" data-paper="CVPR20241339">pixelSplat</a> (62), <a class="paper" data-paper="CVPR20242478">Scaffold-GS</a> (60). Each sub-area has its de-facto baseline: 2DGS for surfaces, 4DGS for dynamics, MVSplat/pixelSplat for feed-forward.</p>
+<div class="callout warn">
+<p>PSNR on Mip-NeRF 360 is saturated. Differences of 0.1–0.3 dB between methods are smaller than the spread between different papers' re-runs of the same 3DGS baseline (27.21 to 29.30 dB in the notes read here). When a paper's headline is a few tenths of a dB, look for its storage, FPS or training-time column instead; that is usually where the real contribution is.</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="trajectory">Trajectory</h2>
+<figure class="chart" data-chart='{"title":"Share of all papers at each venue that are about Gaussian splatting","unit":"%","x":["2024","2025","2026"],"series":[{"name":"CVPR","values":[2.47,8.22,6.54]},{"name":"ECCV","values":[4.52,null,7.23]},{"name":"ICCV","values":[null,8.07,null]},{"name":"NeurIPS","values":[1.80,1.91,null]},{"name":"ICLR","values":[0.13,1.67,1.46]},{"name":"ICML","values":[0.19,0.36,0.52]}]}'>
+<figcaption>From <code>vault.py trend</code> with the topic query below. Points are conference years; submission deadlines run about 6–8 months earlier (CVPR'24 = Nov 2023). ECCV and ICCV alternate years, so read each venue against itself.</figcaption>
+</figure>
+<p>The pattern is fast growth and then a plateau in the vision venues. CVPR went from 2.5% (deadline Nov 2023, three months after 3DGS appeared) to 8.2% a year later, then dipped to 6.5% for CVPR'26. ECCV went from 4.5% to 7.2%, and ICCV'25 sits at 8.1%. Roughly <b>one CVPR/ICCV/ECCV paper in 13–15 is now a Gaussian-splatting paper</b>. The ML venues carry far less 3D. NeurIPS is flat at ~1.8–1.9%, ICLR is flat at ~1.5% after its jump, and ICML is small but growing (0.2 → 0.5%). The CVPR'26 dip alongside ECCV'26's rise is consistent with saturation, not decline, but two points per venue cannot separate the two.</p>
+<p class="small"><b>Query:</b> <code>{title key_contribution}: ("gaussian splatting" OR 3dgs OR "3d gaussians" OR "3d-gs" OR "gaussian splats" OR "gaussian surfels" OR "gaussian primitives" OR 2dgs OR 4dgs OR "4d gaussians" OR "2d gaussians" OR "dynamic gaussians" OR "gaussian avatar" OR "gaussian avatars" OR "street gaussians")</code>, 1,486 papers. <b>Precision</b> (two 20-paper samples): strict rule "Gaussian splats are the paper's 3D/4D scene representation" 16/20 and 18/20; lenient rule "any use of Gaussian splatting as a rendering primitive, incl. 2D images, BEV and MRI" 20/20 and 20/20. <b>Recall:</b> 91% (1,128 of 1,239) of vault papers that build on the original 3DGS paper; 90% (241 of 268) of those building on its five most built-upon descendants. Most misses use 3DGS as a minor component. No edition was flagged incomplete.</p>
+
+<!-- ================================================================== -->
+<h2 id="open">Open problems, and where I'd bet</h2>
+<p>Grouped from the "Why it matters / open questions" and limitations fields of the ~75 notes read:</p>
+<ol>
+<li><b>Per-scene optimisation vs generalisation.</b> Most methods still train one model per scene. Feed-forward models generalise but trail optimisation on detail (Long-LRM's LPIPS still trails optimisation-based 3DGS), and <a class="paper" data-paper="CVPR20262382">FastGS</a>'s note says fine-tuning dense feed-forward outputs is still weak. Raised by <a class="paper" data-paper="CVPR20240858">LangSplat</a>, <a class="paper" data-paper="CVPR20251661">DropGaussian</a>, <a class="paper" data-paper="ICCV20252484">Long-LRM</a>, <a class="paper" data-paper="ICLR20261363">YoNoSplat</a>.</li>
+<li><b>Unseen and occluded regions.</b> Reconstruction cannot invent what no view saw. The fixes import generative priors, from <a class="paper" data-paper="CVPR20251147">Difix3D+</a> to diffusion-guided inpainting. Raised by <a class="paper" data-paper="ECCV20241031">FSGS</a>, <a class="paper" data-paper="NEURIPS20240670">WildGaussians</a>, <a class="paper" data-paper="CVPR20252444">MoSca</a>, <a class="paper" data-paper="ICLR20252162">LVSM</a>.</li>
+<li><b>Dynamics beyond the studio.</b> Monocular video, object entry and exit, long sequences. DyCheck numbers remain low. Raised by <a class="paper" data-paper="CVPR20240949">4DGS</a>, <a class="paper" data-paper="ICLR20240365">4DGS (Yang)</a>, <a class="paper" data-paper="ECCV20261764">KineticGS</a>, <a class="paper" data-paper="CVPR20261737">MoVieS</a>.</li>
+<li><b>Geometry vs appearance.</b> Surface regularisers cost image quality; specular, transparent and fuzzy materials break surface methods. Raised by <a class="paper" data-paper="CVPR20242220">SuGaR</a>, <a class="paper" data-paper="CVPR20252072">Geometry Field Splatting</a>, <a class="paper" data-paper="ICML20262652">AmbiSuR</a>.</li>
+<li><b>Exactness of rendering.</b> Sorting, affine projection and popping, traded against speed. Raised by <a class="paper" data-paper="ICCV20251851">EVER</a>, <a class="paper" data-paper="CVPR20263296">Stochastic RT</a>, <a class="paper" data-paper="CVPR20263765">Jinc kernels</a>.</li>
+<li><b>Dependence on external priors.</b> SAM, monocular depth, DINO, LiDAR, trackers: their errors bound the result. Raised by <a class="paper" data-paper="ECCV20240762">Gaussian Grouping</a>, <a class="paper" data-paper="CVPR20240867">DNGaussian</a>, <a class="paper" data-paper="ECCV20241948">Street Gaussians</a>, <a class="paper" data-paper="ICCV20251580">Shape of Motion</a>.</li>
+<li><b>Physical grounding.</b> Material parameters are set by hand, and lighting is baked in. <a class="paper" data-paper="CVPR20261262">PhysGaia</a> finds that 4DGS trajectories deviate from ground-truth physics. Raised by <a class="paper" data-paper="CVPR20241250">PhysGaussian</a>, <a class="paper" data-paper="CVPR20241188">GaussianAvatars</a> (no relighting).</li>
+</ol>
+<div class="callout opinion">
+<p><b>Where I'd bet.</b> (1) Per-scene 3DGS becomes a <i>refinement step</i>, not the method. A geometry foundation model (the VGGT family) predicts cameras plus Gaussians in a second, and a minute of optimisation polishes them; YoNoSplat's optional post-optimisation is the template. (2) The pixel-aligned layout dies. Fixed or adaptive budgets decoded from scene tokens (GlobalSplat, Off The Grid) are the right abstraction once view counts grow. (3) Generative priors are absorbed into reconstruction, so "fill in what you didn't see" is part of the model rather than a post-hoc fixer. (4) Rasterisation stays for display, but training moves toward more exact rendering. (5) Expect the share of papers to stay near its ~7% plateau in vision venues while the work shifts from "Gaussians for X" to Gaussians as one output head of large 3D models. In that world, knowing <i>how</i> splatting works (this page) matters more than any single paper.</p>
+<p class="small muted">Outside the vault and possibly outdated: work at SIGGRAPH/SIGGRAPH Asia, 3DV and TOG (including 2DGS, Taming 3DGS, 3DGRT and most rendering-systems work), and anything after this vault's last edition (ECCV 2026).</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="reading">Reading path</h2>
+<p class="small muted">The original paper, Kerbl et al., <i>3D Gaussian Splatting for Real-Time Radiance Field Rendering</i> (SIGGRAPH 2023), is not in the vault. Read its Sections 3–6 first or alongside "Start here".</p>
+<h3 id="start-here">Start here</h3>
+<ul class="reading">
+<li data-paper="CVPR20241019"><a class="paper" data-paper="CVPR20241019">Mip-Splatting</a>: its Section 3.2 is the clearest compact restatement of the 3DGS equations, and the rest teaches sampling theory on top. Look at Figure 1 (dilation and erosion).</li>
+<li data-paper="NEURIPS20242572"><a class="paper" data-paper="NEURIPS20242572">3DGS as MCMC</a>: read it to understand what adaptive density control does and why it is fragile. Compare its Eq. 4 and Eq. 5.</li>
+<li data-paper="CVPR20241339"><a class="paper" data-paper="CVPR20241339">pixelSplat</a>: the feed-forward idea and the local-minima argument (Sec. 3); Figure 3 is above.</li>
+<li data-paper="ICLR20240365"><a class="paper" data-paper="ICLR20240365">4DGS (Yang et al.)</a>: Gaussian conditioning as motion; Eqs. 6, 9 and 10.</li>
+</ul>
+<h3 id="core-reading">Core, by sub-area</h3>
+<ul class="reading">
+<li data-paper="CVPR20242478"><a class="paper" data-paper="CVPR20242478">Scaffold-GS</a>: anchors that generate Gaussians; the basis of most structured and compressed variants.</li>
+<li data-paper="NEURIPS20244446"><a class="paper" data-paper="NEURIPS20244446">LightGaussian</a>: the three-part compression recipe (prune, distil SH, quantise).</li>
+<li data-paper="ECCV20240185"><a class="paper" data-paper="ECCV20240185">HAC</a>: entropy coding with a context model, where compression went next.</li>
+<li data-paper="CVPR20242220"><a class="paper" data-paper="CVPR20242220">SuGaR</a>: the first Gaussians-to-mesh pipeline, and what regularising toward surfaces costs.</li>
+<li data-paper="ECCV20242381"><a class="paper" data-paper="ECCV20242381">GS2Mesh</a>: the contrarian move of using a stereo prior instead of the Gaussians' positions.</li>
+<li data-paper="CVPR20242189"><a class="paper" data-paper="CVPR20242189">Deformable 3DGS</a>: the canonical-space-plus-MLP template for dynamics.</li>
+<li data-paper="CVPR20240949"><a class="paper" data-paper="CVPR20240949">4DGS (Wu et al.)</a>: the HexPlane deformation field; the most-compared dynamic baseline.</li>
+<li data-paper="CVPR20241842"><a class="paper" data-paper="CVPR20241842">SC-GS</a>: sparse control points and as-rigid-as-possible motion.</li>
+<li data-paper="ICCV20251580"><a class="paper" data-paper="ICCV20251580">Shape of Motion</a>: monocular 4D with shared motion bases and foundation-model priors.</li>
+<li data-paper="ECCV20240557"><a class="paper" data-paper="ECCV20240557">MVSplat</a>: cost volumes for feed-forward depth; the standard feed-forward baseline.</li>
+<li data-paper="ECCV20240564"><a class="paper" data-paper="ECCV20240564">GS-LRM</a>: a plain transformer predicting per-pixel Gaussians at scale.</li>
+<li data-paper="ICLR20251940"><a class="paper" data-paper="ICLR20251940">NoPoSplat</a>: no poses, Gaussians in a canonical frame.</li>
+<li data-paper="CVPR20240858"><a class="paper" data-paper="CVPR20240858">LangSplat</a>: the attribute-container idea with language features.</li>
+<li data-paper="CVPR20240557"><a class="paper" data-paper="CVPR20240557">Gaussian Splatting SLAM</a>: pose gradients through the rasteriser.</li>
+<li data-paper="CVPR20241250"><a class="paper" data-paper="CVPR20241250">PhysGaussian</a>: Gaussians as simulation particles.</li>
+<li data-paper="ECCV20240081"><a class="paper" data-paper="ECCV20240081">LGM</a>: feed-forward generation with one Gaussian per pixel.</li>
+<li data-paper="CVPR20241188"><a class="paper" data-paper="CVPR20241188">GaussianAvatars</a>: binding Gaussians to a parametric mesh.</li>
+</ul>
+<h3 id="frontier">Frontier</h3>
+<ul class="reading">
+<li data-paper="CVPR20250750"><a class="paper" data-paper="CVPR20250750">VGGT</a>: the geometry foundation model the 2026 papers build on. Not a 3DGS paper, but essential.</li>
+<li data-paper="ICLR20252162"><a class="paper" data-paper="ICLR20252162">LVSM</a>: the no-3D challenger; read it to sharpen your view of what explicit 3D is for.</li>
+<li data-paper="ICLR20261363"><a class="paper" data-paper="ICLR20261363">YoNoSplat</a>: one feed-forward model, any number of views, poses optional.</li>
+<li data-paper="ECCV20262102"><a class="paper" data-paper="ECCV20262102">GlobalSplat</a>: a fixed Gaussian budget from latent tokens instead of per-pixel Gaussians.</li>
+<li data-paper="CVPR20261737"><a class="paper" data-paper="CVPR20261737">MoVieS</a>: feed-forward dynamic Gaussians in under a second.</li>
+<li data-paper="CVPR20252768"><a class="paper" data-paper="CVPR20252768">FreeTimeGS</a>: dynamics without a canonical space.</li>
+<li data-paper="CVPR20263296"><a class="paper" data-paper="CVPR20263296">Stochastic Ray Tracing</a>: unbiased, sort-free rendering of Gaussians.</li>
+<li data-paper="CVPR20262382"><a class="paper" data-paper="CVPR20262382">FastGS</a>: per-scene training in about two minutes; the state of the optimisation route.</li>
+<li data-paper="ICML20262652"><a class="paper" data-paper="ICML20262652">AmbiSuR</a>: where surface reconstruction is now, and how it diagnoses photometric ambiguity.</li>
+</ul>
+
+<!-- ================================================================== -->
+<h2 id="quiz">Check your understanding</h2>
+<p class="small muted">The same questions are in <code>quiz.md</code>; "quiz me on 3d-gaussian-splatting" schedules them for review.</p>
+<details class="quiz"><summary>Why does 3DGS parameterise each covariance as a rotation and a scale instead of optimising the 3×3 matrix directly?</summary><ul><li>A gradient step on a raw matrix can leave the set of symmetric positive semi-definite matrices, and then no ellipsoid exists (the last slider of the covariance widget).</li><li>$RSS^\top R^\top$ is PSD by construction for any quaternion and scales, so the optimiser can move freely; scales are kept positive with an exponential.</li></ul></details>
+<details class="quiz"><summary>NeRF and 3DGS use the same compositing equation. What exactly differs?</summary><ul><li>Where the per-sample alphas come from: NeRF computes $1-e^{-\sigma\delta}$ from a network's density at ray samples; 3DGS uses opacity times a projected 2D Gaussian falloff.</li><li>The direction: NeRF marches rays from pixels (backward); 3DGS projects primitives onto pixels (forward), which makes it rasterisable and fast.</li></ul></details>
+<details class="quiz"><summary>What breaks if you blend the Gaussians in the wrong depth order, and why does 3DGS's per-image sort only approximate the right order?</summary><ul><li>Compositing is not commutative: weights $\alpha_i T_i$ depend on everything in front, so the pixel colour changes.</li><li>3DGS sorts once per image by centre depth; overlapping Gaussians can be in a different order for different pixels, and the order can flip as the camera moves (popping). EVER and ray tracing fix this at a speed cost.</li></ul></details>
+<details class="quiz"><summary>Why can't gradient descent alone decide how many Gaussians a scene needs, and what does adaptive density control do about it?</summary><ul><li>Gaussians have local support, so a region with no Gaussian nearby gives no gradient to attract one, and one large Gaussian cannot turn itself into several.</li><li>ADC uses accumulated screen-space positional gradients: it clones small high-gradient Gaussians, splits large ones and prunes near-transparent ones, with periodic opacity resets.</li></ul></details>
+<details class="quiz"><summary>What does 3DGS-MCMC replace the clone/split heuristics with, and what does it buy?</summary><ul><li>It views training as SGLD sampling (gradient step plus covariance-shaped noise on positions) and replaces densification with relocating dead Gaussians onto live ones, keeping the rendering unchanged.</li><li>A user-set Gaussian budget, less dependence on SfM initialisation (much better from random init), and fewer thresholds.</li></ul></details>
+<details class="quiz"><summary>Why does vanilla 3DGS look wrong when you zoom out, and what are Mip-Splatting's two fixes?</summary><ul><li>The fixed 0.3 px screen-space dilation lets the optimiser make sub-pixel Gaussians; zoomed out, every splat is still dilated to a pixel, so thin structures get too bright and thick (and zoomed in they erode).</li><li>A 3D smoothing filter limits each Gaussian's frequency to its training cameras' Nyquist rate (added to $\Sigma$, free after training), plus a 2D Mip filter that approximates the pixel's box filter instead of dilating.</li></ul></details>
+<details class="quiz"><summary>About 81% of a Gaussian's bytes are one attribute. Which, and what do compression methods do about it?</summary><ul><li>Degree-3 spherical harmonics: 48 of 59 floats.</li><li>Distil to a lower degree, vector-quantise into codebooks, or replace it with a shared hash grid or an anchor's MLP (LightGaussian, Compact 3DGS, Scaffold-GS); entropy coding (HAC) then exploits the remaining correlation.</li></ul></details>
+<details class="quiz"><summary>Why does flattening Gaussians into 2D disks help surface reconstruction, and what does it cost?</summary><ul><li>A ray hits a disk at a single point with an explicit normal, so depth and normal are well-defined; a 3D blob spreads density along the ray.</li><li>Image quality drops on volumetric or fuzzy content, which the volumetric fuzz was faking (e.g. SuGaR's refined model at 27.27 vs 28.69 dB in its note).</li></ul></details>
+<details class="quiz"><summary>In Yang et al.'s 4DGS, which part of the 4D covariance encodes motion, and how does a primitive appear and disappear?</summary><ul><li>The space-time block $\Sigma_{1:3,4}$ (the tilt); the conditional mean slides as $\Sigma_{1:3,4}\Sigma_{4,4}^{-1}(t-\mu_t)$, a velocity.</li><li>The marginal $p(t)=\mathcal N(t;\mu_t,\Sigma_{4,4})$ multiplies the opacity, so the primitive fades in and out around its time; primitives with $p(t)\lt 0.05$ are skipped.</li></ul></details>
+<details class="quiz"><summary>Contrast canonical-space deformation with native space-time primitives for dynamic scenes. When does each struggle?</summary><ul><li>Canonical plus deformation (Deformable 3DGS, Wu 4DGS, SC-GS): compact, with shared geometry over time, but fast or complex motion needs long-range correspondence to a rest pose, which is ill-posed.</li><li>Space-time primitives (Yang 4DGS, STG, FreeTimeGS): handle fast motion and appearing content, but have weaker long-range consistency and need more primitives; FreeTimeGS models only short-range linear motion.</li></ul></details>
+<details class="quiz"><summary>Why does pixelSplat sample a depth bucket and set opacity to its probability, instead of regressing depth directly?</summary><ul><li>Directly regressed Gaussian positions get stuck in local minima: gradients vanish a few standard deviations away, and moving through empty space would occlude other content.</li><li>Tying opacity to the sampled bucket's probability lets gradients raise the probability of good depths: a reparameterisation that acts like differentiable spawning and deleting (worth about 1 dB).</li></ul></details>
+<details class="quiz"><summary>What does NoPoSplat change about where Gaussians are predicted, and why does that remove the need for poses?</summary><ul><li>It predicts all views' Gaussians directly in the first camera's coordinate frame, instead of predicting per-view Gaussians and transforming them with known poses.</li><li>The network learns relative geometry implicitly; intrinsics still enter (as a token) to fix scale.</li></ul></details>
+<details class="quiz"><summary>LVSM beats GS-LRM on PSNR without any 3D representation. Give two reasons the field still builds explicit Gaussians.</summary><ul><li>Explicit 3D can be edited, segmented, simulated and rendered in real time anywhere; LVSM must run a large transformer for every frame.</li><li>LVSM is deterministic and weak on unseen regions and out-of-distribution resolutions, with flicker; Gaussians give multi-view consistency by construction.</li></ul></details>
+<details class="quiz"><summary>What is the problem with one Gaussian per input pixel as the number of views grows, and what replaces it?</summary><ul><li>The count grows linearly with views and pixels, mostly duplicating the same surfaces: memory and render cost explode.</li><li>Decode a fixed budget from latent scene tokens (GlobalSplat) or detect primitives at sub-pixel positions with adaptive counts (Off The Grid).</li></ul></details>
+<details class="quiz"><summary>Why can PhysGaussian render the simulated state directly, without converting to a mesh?</summary><ul><li>Each Gaussian is an MPM particle; under the local affine deformation gradient $F$ a Gaussian stays a Gaussian, with covariance $F\Sigma F^\top$ (and SH rotated by $F$'s rotation part).</li><li>So the simulated primitives are exactly the rendered ones; no intermediate geometry that could mismatch the appearance.</li></ul></details>
+
+<!-- ================================================================== -->
+<h2 id="method">How this primer was built</h2>
+<ul class="small">
+<li><b>Topic:</b> 1,486 papers matching the query in <a href="#trajectory">Trajectory</a>; precision strict 34/40, lenient 40/40 over two 20-paper samples; recall 91% vs papers building on the original 3DGS, 90% vs papers building on its five most built-upon descendants. IDs in <code>topic_ids.txt</code>.</li>
+<li><b>vault.db</b> built 2026-10-16 at commit bda0d29; 14 editions, CVPR 2024 to ECCV 2026; no edition flagged incomplete.</li>
+<li><b>Sub-area shares</b> come from overlapping keyword queries within the topic (<code>trend --within</code>), checked with 10-paper samples: feed-forward ~8/10, dynamic ~7/10. The "compact" and "surfaces" queries were noisier (~5/10), so treat those shares as rough.</li>
+<li><b>Read:</b> about 75 notes (sections problem, method, results, why, plus limitations and builds_on), split across four reading passes. OCR passages of 7 papers: Mip-Splatting (3DGS restatement, all four result tables), 3DGS-MCMC (SGLD and relocation), 4DGS Yang (conditioning equations), 4DGS Wu (HexPlane), pixelSplat (probabilistic depth), LightGaussian and Scaffold-GS (Mip-NeRF 360 tables).</li>
+<li><b>Numbers</b> about specific papers are from their notes or OCR; the ones checked against OCR are marked. Counts are from <code>vault.py trend</code> and <code>sql</code>.</li>
+<li><b>My own explanation, not the vault:</b> the prerequisites (SfM, NeRF, volume rendering, EWA splatting), the step-by-step derivation, the worked example, the widgets, the details of the original 3DGS paper (tile size, thresholds, loss weights, iteration counts; the paper is not in the vault, so these are from memory), the benchmark blind spots, and every "My read" box.</li>
+<li><b>Out of scope:</b> SIGGRAPH/TOG/3DV papers (2DGS, Taming 3DGS, 3DGRT, original 3DGS), rendering-systems and web-viewer engineering, and anything after ECCV 2026.</li>
+</ul>
+
+</main>
+</div>
+<script src="../_kit/primer.js"></script>
+<script>
+(function () {
+  "use strict";
+  const P = window.Primer;
+  /* text colour goes in style (a fill attribute also works with the current kit) */
+  const S = (tag, a, p) => { if (tag === "text" && a && a.fill) { a = Object.assign({}, a); a.style = "fill:" + a.fill; delete a.fill; } return P.svg(tag, a, p); };
+  const hex = h => { h = (h || "#888888").trim().replace("#", ""); if (h.length === 3) h = h.split("").map(c => c + c).join(""); return [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) || 0); };
+  const rgb = c => `rgb(${c.map(v => Math.round(Math.max(0, Math.min(255, v)))).join(",")})`;
+
+  /* ---- 1. front-to-back compositing along one ray ------------------------------------ */
+  (function () {
+    const g = document.getElementById("comp"), ctl = document.getElementById("compc"), out = document.getElementById("compr");
+    if (!g) return;
+    const xs = [150, 230, 310, 390, 470], toks = ["s1", "s2", "s3", "s4", "s5"];
+    let alpha = 0.5, k = 0, wrong = false;
+    function draw() {
+      g.innerHTML = "";
+      const cols = toks.map(t => hex(P.color(t))), bg = hex(P.color("card"));
+      const order = wrong ? [4, 3, 2, 1, 0] : [0, 1, 2, 3, 4];
+      // composite the first k of `order`, with early termination
+      let T = 1, C = [0, 0, 0]; const info = {};
+      order.forEach((idx, n) => {
+        const skipped = T < 1e-4;
+        info[idx] = { T, w: skipped ? 0 : alpha * T, n, skipped, done: n < k };
+        if (n < k && !skipped) { for (let c = 0; c < 3; c++) C[c] += cols[idx][c] * alpha * T; T *= 1 - alpha; }
+      });
+      const Tnow = order.slice(0, k).reduce((t, idx) => info[idx].skipped ? t : t * (1 - alpha), 1);
+      // eye + ray
+      S("polygon", { points: "20,100 46,84 46,116", fill: "var(--card)", stroke: "var(--fg)", "stroke-width": 1.5 }, g);
+      S("text", { x: 33, y: 140, "text-anchor": "middle", "font-size": 12, text: "pixel" }, g);
+      S("line", { x1: 46, y1: 100, x2: 530, y2: 100, stroke: "var(--muted)", "stroke-width": 1.5, "stroke-dasharray": "5 4" }, g);
+      S("text", { x: 530, y: 30, "text-anchor": "end", "font-size": 12, fill: "var(--muted)", text: wrong ? "blend order: far → near (wrong)" : "blend order: near → far" }, g);
+      xs.forEach((x, i) => {
+        const f = info[i];
+        S("ellipse", { cx: x, cy: 100, rx: 28, ry: 44, fill: `var(--${toks[i]})`, "fill-opacity": 0.15 + 0.75 * alpha,
+          stroke: f.done ? "var(--fg)" : "var(--line)", "stroke-width": f.done ? 2.5 : 1, "stroke-dasharray": f.skipped ? "4 3" : "none" }, g);
+        S("text", { x, y: 164, "text-anchor": "middle", "font-size": 12, fill: "var(--muted)", text: f.skipped ? "skipped" : `T=${f.T.toFixed(3)}` }, g);
+        const h = 70 * f.w;
+        S("line", { x1: x - 22, x2: x + 22, y1: 250, y2: 250, stroke: "var(--line)" }, g);
+        S("rect", { x: x - 14, y: 250 - h, width: 28, height: Math.max(h, 0.5), fill: `var(--${toks[i]})`, opacity: f.done ? 1 : 0.25 }, g);
+        S("text", { x, y: 266, "text-anchor": "middle", "font-size": 12, text: `w=${f.w.toFixed(3)}` }, g);
+      });
+      S("text", { x: 92, y: 214, "text-anchor": "end", "font-size": 12, fill: "var(--muted)", text: "weight" }, g);
+      S("text", { x: 92, y: 230, "text-anchor": "end", "font-size": 12, fill: "var(--muted)", text: "w = αT" }, g);
+      // pixel swatch: accumulated colour + remaining transmittance × background
+      const pix = C.map((c, j) => c + Tnow * bg[j]);
+      S("rect", { x: 575, y: 50, width: 100, height: 100, rx: 10, fill: rgb(pix), stroke: "var(--fg)" }, g);
+      S("text", { x: 625, y: 170, "text-anchor": "middle", "font-size": 13, text: "pixel so far" }, g);
+      S("text", { x: 625, y: 188, "text-anchor": "middle", "font-size": 12, fill: "var(--muted)", text: `T = ${Tnow.toExponential(1)}` }, g);
+      const nSkipped = order.filter(i => info[i].skipped).length;
+      out.textContent = `blended ${Math.min(k, 5)}/5 · transmittance left T = ${Tnow.toFixed(4)} · ` +
+        (nSkipped ? `${nSkipped} Gaussian(s) skipped: T fell below 1e-4 before reaching them` : "no early termination at this opacity");
+    }
+    P.slider(ctl, { label: "opacity α", min: 0.05, max: 0.95, step: 0.05, value: alpha }, v => { alpha = v; draw(); });
+    const btn = (t, f) => { const b = P.el("button", { type: "button", text: t }, ctl); b.onclick = () => { f(); draw(); }; return b; };
+    btn("Step", () => { k = Math.min(5, k + 1); });
+    btn("Blend all", () => { k = 5; });
+    btn("Reset", () => { k = 0; });
+    const wb = btn("Wrong order", () => { wrong = !wrong; wb.textContent = wrong ? "Correct order" : "Wrong order"; });
+    P.onTheme(draw);
+    draw();
+  })();
+
+  /* ---- 2. covariance = R S S^T R^T ----------------------------------------------------- */
+  (function () {
+    const g = document.getElementById("g2d"), ctl = document.getElementById("g2dc");
+    if (!g) return;
+    let s1 = 2, s2 = 0.5, th = 30, nudge = 0;
+    const U = 28, cx = 160, cy = 150;
+    function draw() {
+      g.innerHTML = "";
+      for (let i = -5; i <= 5; i++) {
+        S("line", { x1: cx + i * U, x2: cx + i * U, y1: cy - 5 * U, y2: cy + 5 * U, stroke: "var(--line)" }, g);
+        S("line", { y1: cy + i * U, y2: cy + i * U, x1: cx - 5 * U, x2: cx + 5 * U, stroke: "var(--line)" }, g);
+      }
+      const t = th * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
+      const a = s1 * s1 * c * c + s2 * s2 * s * s, d = s1 * s1 * s * s + s2 * s2 * c * c, b0 = (s1 * s1 - s2 * s2) * c * s, b = b0 + nudge;
+      const tr = (a + d) / 2, disc = Math.sqrt(((a - d) / 2) ** 2 + b * b), l1 = tr + disc, l2 = tr - disc, det = a * d - b * b;
+      const valid = l2 > 1e-9;
+      const ang = 0.5 * Math.atan2(2 * b, a - d) * 180 / Math.PI;
+      if (valid) {
+        [2, 1].forEach(k => S("ellipse", { cx, cy, rx: k * Math.sqrt(l1) * U, ry: k * Math.sqrt(l2) * U, transform: `rotate(${-ang} ${cx} ${cy})`,
+          fill: "var(--accent)", "fill-opacity": 0.14 + 0.12 * (2 - k), stroke: "var(--accent)", "stroke-width": k === 1 ? 2 : 1 }, g));
+        const ar = -ang * Math.PI / 180;
+        S("line", { x1: cx, y1: cy, x2: cx + Math.sqrt(l1) * U * Math.cos(ar), y2: cy + Math.sqrt(l1) * U * Math.sin(ar), stroke: "var(--s2)", "stroke-width": 2.5 }, g);
+        S("line", { x1: cx, y1: cy, x2: cx - Math.sqrt(l2) * U * Math.sin(ar), y2: cy + Math.sqrt(l2) * U * Math.cos(ar), stroke: "var(--s3)", "stroke-width": 2.5 }, g);
+      } else {
+        S("ellipse", { cx, cy, rx: 0, ry: 0 }, g); // keeps a node for scripted checks
+        S("text", { x: cx, y: cy - 6, "text-anchor": "middle", "font-size": 14, fill: "var(--bad)", text: "no ellipse:" }, g);
+        S("text", { x: cx, y: cy + 14, "text-anchor": "middle", "font-size": 14, fill: "var(--bad)", text: "Σ is not a covariance" }, g);
+      }
+      S("circle", { cx, cy, r: 3.5, fill: "var(--fg)" }, g);
+      const X = 340, f = v => (v >= 0 ? " " : "") + v.toFixed(2);
+      const T = (y, txt, extra) => S("text", Object.assign({ x: X, y, "font-size": 14, "font-family": "var(--mono)", text: txt }, extra || {}), g);
+      T(30, "Σ = R S Sᵀ Rᵀ" + (nudge ? " + nudge" : ""), { "font-weight": 650 });
+      T(62, `S = diag(${s1.toFixed(2)}, ${s2.toFixed(2)})   θ = ${th.toFixed(0)}°`, { fill: "var(--muted)" });
+      T(100, `Σ = ⎡${f(a)}  ${f(b)} ⎤`); T(122, `    ⎣${f(b)}  ${f(d)} ⎦`);
+      T(160, `det Σ = ${det.toFixed(3)}`, { fill: valid ? "var(--fg)" : "var(--bad)" });
+      T(184, `eigenvalues  ${l1.toFixed(2)}, ${l2.toFixed(2)}`, { fill: valid ? "var(--fg)" : "var(--bad)" });
+      T(222, "orange: s₁ axis   green: s₂ axis", { fill: "var(--muted)", "font-size": 12 });
+      T(244, "rings: 1σ and 2σ contours", { fill: "var(--muted)", "font-size": 12 });
+      T(276, valid ? "valid: positive semi-definite" : "invalid: a negative eigenvalue", { fill: valid ? "var(--ok)" : "var(--bad)", "font-weight": 650 });
+    }
+    P.slider(ctl, { label: "scale s₁", min: 0.2, max: 2.5, step: 0.05, value: s1 }, v => { s1 = v; draw(); });
+    P.slider(ctl, { label: "scale s₂", min: 0.2, max: 2.5, step: 0.05, value: s2 }, v => { s2 = v; draw(); });
+    P.slider(ctl, { label: "rotation θ", min: 0, max: 180, step: 1, value: th, fmt: v => v.toFixed(0) + "°" }, v => { th = v; draw(); });
+    P.slider(ctl, { label: "nudge Σ₁₂ directly", min: -4, max: 4, step: 0.05, value: 0 }, v => { nudge = v; draw(); });
+    draw();
+  })();
+
+  /* ---- 3. adaptive density control in 1D ---------------------------------------------- */
+  (function () {
+    const g = document.getElementById("dens"), ctl = document.getElementById("densc"), out = document.getElementById("densr");
+    if (!g) return;
+    const M = 240, X = Array.from({ length: M }, (_, i) => i / (M - 1));
+    const target = x => 0.5 * Math.exp(-0.5 * ((x - 0.14) / 0.05) ** 2) + 0.75 * Math.exp(-0.5 * ((x - 0.35) / 0.012) ** 2)
+      + 0.6 * Math.exp(-0.5 * ((x - 0.44) / 0.012) ** 2) + 0.45 * (x > 0.58 && x < 0.86 ? 1 : 0) + 0.3 * Math.exp(-0.5 * ((x - 0.95) / 0.015) ** 2);
+    const Y = X.map(target);
+    let G, iter, last, rng;
+    const rand = () => { rng = (rng * 1664525 + 1013904223) % 4294967296; return rng / 4294967296; };
+    function reset() {
+      rng = 7; iter = 0; last = "initialised at 3 sparse 'SfM points'";
+      G = [0.15, 0.4, 0.72].map(m => ({ a: 0.3, m, ls: Math.log(0.07), acc: 0, n: 0, tag: "" }));
+      G.forEach(q => { q.ma = [0, 0, 0]; q.va = [0, 0, 0]; });
+    }
+    const model = x => G.reduce((s, q) => s + q.a * Math.exp(-0.5 * ((x - q.m) / Math.exp(q.ls)) ** 2), 0);
+    function optimise(n) {
+      const lr = [0.01, 0.004, 0.02], b1 = 0.9, b2 = 0.999;
+      for (let it = 0; it < n; it++) {
+        iter++;
+        const c0 = rand() * 0.8, idx = X.map((x, i) => i).filter(i => X[i] >= c0 && X[i] <= c0 + 0.2); // one "view": a random window
+        const grads = G.map(() => [0, 0, 0]);
+        idx.forEach(i => {
+          const x = X[i], r = model(x) - Y[i];
+          G.forEach((q, j) => { const s = Math.exp(q.ls), u = (x - q.m) / s, e = Math.exp(-0.5 * u * u);
+            grads[j][0] += 2 * r * e; grads[j][1] += 2 * r * q.a * e * u / s; grads[j][2] += 2 * r * q.a * e * u * u; });
+        });
+        G.forEach((q, j) => {
+          const gr = grads[j].map(v => v / idx.length);
+          if (Math.abs(gr[1]) > 0) { q.acc += Math.abs(gr[1]); q.n++; }
+          ["a", "m", "ls"].forEach((key, p) => {
+            q.ma[p] = b1 * q.ma[p] + (1 - b1) * gr[p]; q.va[p] = b2 * q.va[p] + (1 - b2) * gr[p] * gr[p];
+            q[key] -= lr[p] * (q.ma[p] / (1 - b1 ** (q.n + 1))) / (Math.sqrt(q.va[p] / (1 - b2 ** (q.n + 1))) + 1e-8);
+          });
+          q.ls = Math.max(Math.log(0.004), Math.min(Math.log(0.3), q.ls));
+        });
+      }
+      G.forEach(q => { q.tag = ""; });
+    }
+    function densify() {
+      const TAU = 0.035, SMALL = 0.025; let nc = 0, ns = 0, np = 0;
+      const next = [];
+      const fresh = (q, o) => Object.assign({ a: q.a, m: q.m, ls: q.ls, acc: 0, n: 0, tag: "", ma: [0, 0, 0], va: [0, 0, 0] }, o);
+      G.forEach(q => {
+        const gm = q.n ? q.acc / q.n : 0, s = Math.exp(q.ls);
+        if (Math.abs(q.a) < 0.02) { np++; return; }                                  // prune faint
+        if (gm > TAU && G.length + nc + ns < 40 && s < SMALL) { nc++; next.push(fresh(q, { a: q.a / 2, tag: "" }), fresh(q, { a: q.a / 2, m: q.m + (rand() - 0.5) * 4 * s, tag: "clone" })); }
+        else if (gm > TAU && G.length + nc + ns < 40) { ns++; const ls = Math.log(s / 1.6);
+          next.push(fresh(q, { m: q.m - 0.6 * s, ls, a: q.a * 0.65, tag: "split" }), fresh(q, { m: q.m + 0.6 * s, ls, a: q.a * 0.65, tag: "split" })); }
+        else next.push(fresh(q, { tag: "" }));
+      });
+      G = next; last = `+${nc} cloned, ${ns} split into 2, −${np} pruned`;
+    }
+    function draw() {
+      g.innerHTML = "";
+      const L = 40, R = 680, T = 20, B = 250, sx = x => L + (R - L) * x, sy = y => B - (B - T) * y / 1.0;
+      S("line", { x1: L, x2: R, y1: B, y2: B, stroke: "var(--line)" }, g);
+      const path = f => X.map((x, i) => (i ? "L" : "M") + sx(x).toFixed(1) + " " + sy(f(x, i)).toFixed(1)).join("");
+      S("path", { d: path((x, i) => Y[i]), fill: "none", stroke: "var(--faint)", "stroke-width": 6, "stroke-linejoin": "round", opacity: 0.6 }, g);
+      G.forEach(q => {
+        const col = q.tag === "clone" ? "var(--s3)" : q.tag === "split" ? "var(--s2)" : "var(--s1)";
+        const s = Math.exp(q.ls);
+        S("path", { d: path(x => q.a * Math.exp(-0.5 * ((x - q.m) / s) ** 2)) + `L${sx(1)} ${sy(0)}L${sx(0)} ${sy(0)}Z`, fill: col, "fill-opacity": 0.22, stroke: col, "stroke-width": 1.2 }, g);
+        S("circle", { cx: sx(q.m), cy: B + 10, r: 3.5, fill: col }, g);
+      });
+      S("path", { d: path(x => model(x)), fill: "none", stroke: "var(--fg)", "stroke-width": 2 }, g);
+      const mse = X.reduce((s, x, i) => s + (model(x) - Y[i]) ** 2, 0) / M;
+      S("text", { x: R, y: T + 4, "text-anchor": "end", "font-size": 13, text: `${G.length} Gaussians · MSE ${mse.toFixed(4)}` }, g);
+      S("text", { x: L, y: 288, "font-size": 12, fill: "var(--muted)", text: "dots: Gaussian centres · grey: target · dark line: sum of Gaussians" }, g);
+      out.textContent = `iteration ${iter} · last density step: ${last}`;
+    }
+    const btn = (t, f) => { const b = P.el("button", { type: "button", text: t }, ctl); b.onclick = () => { f(); draw(); }; return b; };
+    btn("Optimise 150 steps", () => optimise(150));
+    btn("Densify + prune", () => densify());
+    btn("Auto (6 rounds)", () => { for (let r = 0; r < 6; r++) { optimise(150); densify(); } optimise(150); });
+    btn("Reset", () => reset());
+    reset(); draw();
+  })();
+
+  /* ---- 4. slicing a space-time Gaussian ---------------------------------------------- */
+  (function () {
+    const g = document.getElementById("slice"), ctl = document.getElementById("slicec"), out = document.getElementById("slicer");
+    if (!g) return;
+    let t = 0.35, v = 1.2, st = 0.15;
+    const mt = 0.5, mx = 0, sxc = 0.12; // centre in time / space, conditional spatial std
+    const L = 50, R = 500, T = 20, B = 290, px = tt => L + (R - L) * tt, py = x => (T + B) / 2 - x * (B - T) / 2.6;
+    function draw() {
+      g.innerHTML = "";
+      const Stt = st * st, Sxt = v * Stt, Sxx = sxc * sxc + v * v * Stt;
+      // axes
+      S("rect", { x: L, y: T, width: R - L, height: B - T, fill: "none", stroke: "var(--line)" }, g);
+      S("text", { x: (L + R) / 2, y: B + 22, "text-anchor": "middle", "font-size": 12, fill: "var(--muted)", text: "time t" }, g);
+      S("text", { x: L - 14, y: (T + B) / 2, "text-anchor": "middle", "font-size": 12, fill: "var(--muted)", transform: `rotate(-90 ${L - 14} ${(T + B) / 2})`, text: "space x" }, g);
+      // 1,2-sigma contours via Cholesky of [[Stt,Sxt],[Sxt,Sxx]] in (t,x)
+      const l11 = Math.sqrt(Stt), l21 = Sxt / l11, l22 = Math.sqrt(Math.max(Sxx - l21 * l21, 1e-9));
+      [2, 1].forEach(k => {
+        let d = "";
+        for (let i = 0; i <= 72; i++) { const ph = i / 72 * 2 * Math.PI, a = Math.cos(ph) * k, b = Math.sin(ph) * k;
+          const tt = mt + l11 * a, xx = mx + l21 * a + l22 * b; d += (i ? "L" : "M") + px(tt).toFixed(1) + " " + py(xx).toFixed(1); }
+        S("path", { d: d + "Z", fill: "var(--s4)", "fill-opacity": k === 1 ? 0.3 : 0.12, stroke: "var(--s4)", "stroke-width": k === 1 ? 2 : 1 }, g);
+      });
+      // trajectory of the conditional mean
+      S("line", { x1: px(0), y1: py(mx + v * (0 - mt)), x2: px(1), y2: py(mx + v * (1 - mt)), stroke: "var(--s4)", "stroke-dasharray": "4 4" }, g);
+      // slice
+      const mu = mx + Sxt / Stt * (t - mt), sd = Math.sqrt(Sxx - Sxt * Sxt / Stt), pt = Math.exp(-0.5 * (t - mt) ** 2 / Stt);
+      S("line", { x1: px(t), x2: px(t), y1: T, y2: B, stroke: "var(--accent)", "stroke-width": 2 }, g);
+      S("circle", { cx: px(t), cy: py(mu), r: 5, fill: "var(--accent)" }, g);
+      S("text", { x: px(t) + 6, y: T + 14, "font-size": 12, fill: "var(--accent)", text: `t = ${t.toFixed(2)}` }, g);
+      // right panel: what the rasteriser gets at time t
+      const X0 = 560, W = 120;
+      S("line", { x1: X0, x2: X0, y1: T, y2: B, stroke: "var(--line)" }, g);
+      S("text", { x: X0 + W / 2, y: B + 22, "text-anchor": "middle", "font-size": 12, fill: "var(--muted)", text: "slice at t" }, g);
+      let d = "";
+      for (let i = 0; i <= 80; i++) { const xx = -1.3 + 2.6 * i / 80, val = pt * Math.exp(-0.5 * ((xx - mu) / sd) ** 2); d += (i ? "L" : "M") + (X0 + W * val).toFixed(1) + " " + py(xx).toFixed(1); }
+      const culled = pt < 0.05;
+      S("path", { d, fill: "none", stroke: culled ? "var(--faint)" : "var(--accent)", "stroke-width": 2.2, "stroke-dasharray": culled ? "4 3" : "none" }, g);
+      S("line", { x1: X0 + W, x2: X0 + W, y1: T, y2: B, stroke: "var(--line)", "stroke-dasharray": "2 4" }, g);
+      S("text", { x: X0 + W, y: T - 4, "text-anchor": "end", "font-size": 12, fill: "var(--muted)", text: "weight 1" }, g);
+      if (culled) S("text", { x: X0 + W / 2, y: (T + B) / 2, "text-anchor": "middle", "font-size": 13, fill: "var(--bad)", text: "skipped" }, g);
+      out.textContent = `μ_x|t = ${mu.toFixed(2)} · σ_x|t = ${sd.toFixed(2)} · p(t) = ${pt.toFixed(2)} → effective opacity = α·${pt.toFixed(2)}` + (culled ? " · p(t) < 0.05: not rendered" : "");
+    }
+    P.slider(ctl, { label: "render time t", min: 0, max: 1, step: 0.01, value: t }, x => { t = x; draw(); });
+    P.slider(ctl, { label: "velocity", min: -2, max: 2, step: 0.05, value: v }, x => { v = x; draw(); });
+    P.slider(ctl, { label: "lifetime", min: 0.04, max: 0.4, step: 0.01, value: st }, x => { st = x; draw(); });
+    draw();
+  })();
+})();
+</script>
+<script id="papers" type="application/json">{
+"CVPR20240557": {
+"title": "Gaussian Splatting SLAM",
+"short": "Gaussian Splatting SLAM",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Hidenobu Matsuki et al.",
+"contribution": "The first online visual SLAM system using 3D Gaussian Splatting as the sole scene representation, achieving state-of-the-art monocular tracking (3.96 cm ATE without loop closure) and novel view synthesis (38.94 dB PSNR at 769 FPS) at 3 fps through an analytic SE(3) camera-pose Jacobian for differentiable rasterisation, isotropic Gaussian shape regularisation, and covisibility-based keyframe management.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Matsuki_Gaussian_Splatting_SLAM_CVPR_2024_paper.pdf",
+"code": null,
+"note": "CVPR2024/papers/CVPR20240557.md",
+"built_on_by": 17
+},
+"CVPR20240747": {
+"title": "DUSt3R: Geometric 3D Vision Made Easy",
+"short": "DUSt3R",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Shuzhe Wang et al.",
+"contribution": "Introduces DUSt3R, a single Transformer-based network that regresses dense 3D pointmaps from image pairs without any camera intrinsics or extrinsics, unifying monocular depth, multi-view depth, relative/absolute pose estimation, pixel matching, and dense 3D reconstruction into one zero-shot model, with a fast global alignment procedure for multi-view fusion that optimizes 3D point-to-point distances rather than 2D reprojection errors.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Wang_DUSt3R_Geometric_3D_Vision_Made_Easy_CVPR_2024_paper.pdf",
+"code": "https://github.com/naver/dust3r",
+"note": "CVPR2024/papers/CVPR20240747.md",
+"built_on_by": 91
+},
+"CVPR20240858": {
+"title": "LangSplat: 3D Language Gaussian Splatting",
+"short": "LangSplat",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Minghan Qin et al.",
+"contribution": "LangSplat is the first 3D Gaussian Splatting-based method for 3D language fields, combining SAM's three-level hierarchical segmentation to resolve point ambiguity and a scene-specific language autoencoder (compressing 512-dim CLIP features to 3-dim latent space) to enable real-time open-vocabulary 3D querying, achieving 199× speedup over LERF at 1440×1080 while significantly improving segmentation accuracy.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Qin_LangSplat_3D_Language_Gaussian_Splatting_CVPR_2024_paper.pdf",
+"code": "https://langsplat.github.io/",
+"note": "CVPR2024/papers/CVPR20240858.md",
+"built_on_by": 18
+},
+"CVPR20240867": {
+"title": "DNGaussian: Optimizing Sparse-View 3D Gaussian Radiance Fields with Global-Local Depth Normalization",
+"short": "DNGaussian",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Jiahe Li et al.",
+"contribution": "A depth-regularized 3D Gaussian Splatting framework (DNGaussian) that introduces Hard/Soft depth regularization with shape freezing and Global-Local Depth Normalization to correct geometry degradation under sparse views, achieving competitive novel view synthesis quality with 25× faster training (3.5 min) and 3000× faster real-time rendering (300 FPS) than NeRF-based baselines.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Li_DNGaussian_Optimizing_Sparse-View_3D_Gaussian_Radiance_Fields_with_Global-Local_Depth_CVPR_2024_paper.pdf",
+"code": "https://github.com/Fictionarry/DNGaussian",
+"note": "CVPR2024/papers/CVPR20240867.md",
+"built_on_by": 6
+},
+"CVPR20240949": {
+"title": "4D Gaussian Splatting for Real-Time Dynamic Scene Rendering",
+"short": "4D Gaussian Splatting for Real-Time ...",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Guanjun Wu et al.",
+"contribution": "Proposes 4D Gaussian Splatting (4D-GS), a compact dynamic scene representation that maintains a single canonical set of 3D Gaussians and predicts per-timestamp deformations via a lightweight spatial-temporal HexPlane encoder and multi-head MLP decoder, achieving real-time rendering (82 FPS at 800×800) with only 18 MB storage while matching or exceeding state-of-the-art quality on synthetic and real dynamic scene benchmarks.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Wu_4D_Gaussian_Splatting_for_Real-Time_Dynamic_Scene_Rendering_CVPR_2024_paper.pdf",
+"code": "https://guanjunwu.github.io/4dgs/",
+"note": "CVPR2024/papers/CVPR20240949.md",
+"built_on_by": 44
+},
+"CVPR20241019": {
+"title": "Mip-Splatting: Alias-free 3D Gaussian Splatting",
+"short": "Mip-Splatting",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Zehao Yu et al.",
+"contribution": "Introduces Mip-Splatting, which adds a 3D smoothing filter (band-limiting each Gaussian primitive via the Nyquist-Shannon sampling theorem) and a 2D Mip filter (Gaussian approximation of the physical pixel box filter) to 3D Gaussian Splatting, enabling alias-free novel view rendering at arbitrary sampling rates from single-scale training.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Yu_Mip-Splatting_Alias-free_3D_Gaussian_Splatting_CVPR_2024_paper.pdf",
+"code": null,
+"note": "CVPR2024/papers/CVPR20241019.md",
+"built_on_by": 18
+},
+"CVPR20241188": {
+"title": "GaussianAvatars: Photorealistic Head Avatars with Rigged 3D Gaussians",
+"short": "GaussianAvatars",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Shenhan Qian et al.",
+"contribution": "A method for photorealistic, fully controllable head avatars that rigs 3D Gaussian splats to a parametric FLAME mesh via local coordinate frames, with a binding inheritance strategy for adaptive density control and thresholded position/scaling regularization losses, achieving state-of-the-art novel-view synthesis (PSNR 31.6 dB) and reenactment performance on NeRSemble.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Qian_GaussianAvatars_Photorealistic_Head_Avatars_with_Rigged_3D_Gaussians_CVPR_2024_paper.pdf",
+"code": null,
+"note": "CVPR2024/papers/CVPR20241188.md",
+"built_on_by": 31
+},
+"CVPR20241250": {
+"title": "PhysGaussian: Physics-Integrated 3D Gaussians for Generative Dynamics",
+"short": "PhysGaussian",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Tianyi Xie et al.",
+"contribution": "A unified simulation-rendering pipeline that uses the same 3D Gaussian kernels as both Material Point Method particles and splatting primitives, where the continuum mechanics deformation gradient analytically deforms Gaussian covariances (F·A·Fᵀ) and rotates spherical harmonic bases via polar decomposition, eliminating all meshing or geometry-embedding steps between physics and rendering.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Xie_PhysGaussian_Physics-Integrated_3D_Gaussians_for_Generative_Dynamics_CVPR_2024_paper.pdf",
+"code": "https://xpandora.github.io/PhysGaussian/",
+"note": "CVPR2024/papers/CVPR20241250.md",
+"built_on_by": 17
+},
+"CVPR20241339": {
+"title": "pixelSplat: 3D Gaussian Splats from Image Pairs for Scalable Generalizable 3D Reconstruction",
+"short": "pixelSplat",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "David Charatan et al.",
+"contribution": "First feed-forward model that predicts a 3D Gaussian splatting radiance field from a pair of images in a single forward pass, using a probabilistic depth-bucket sampling scheme with an opacity-probability reparameterization trick to overcome local minima in differentiable primitive regression, combined with an epipolar transformer to resolve SfM scale ambiguity, achieving 650× faster rendering than prior generalizable baselines while producing an explicit, editable 3D scene.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Charatan_pixelSplat_3D_Gaussian_Splats_from_Image_Pairs_for_Scalable_Generalizable_CVPR_2024_paper.pdf",
+"code": null,
+"note": "CVPR2024/papers/CVPR20241339.md",
+"built_on_by": 16
+},
+"CVPR20241427": {
+"title": "DrivingGaussian: Composite Gaussian Splatting for Surrounding Dynamic Autonomous Driving Scenes",
+"short": "DrivingGaussian",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Xiaoyu Zhou et al.",
+"contribution": "Introduces Composite Gaussian Splatting, the first 3D Gaussian Splatting framework for full-surround (360°) dynamic driving scenes, decomposing the scene into an incrementally-built static background and a graph of individually-modeled dynamic objects with LiDAR geometric priors, achieving SOTA novel-view synthesis on nuScenes (PSNR 28.74) and KITTI-360 (PSNR 25.62).",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Zhou_DrivingGaussian_Composite_Gaussian_Splatting_for_Surrounding_Dynamic_Autonomous_Driving_Scenes_CVPR_2024_paper.pdf",
+"code": "https://github.com/VDIGPKU/DrivingGaussian",
+"note": "CVPR2024/papers/CVPR20241427.md",
+"built_on_by": 2
+},
+"CVPR20241810": {
+"title": "SplaTAM: Splat, Track & Map 3D Gaussians for Dense RGB-D SLAM",
+"short": "SplaTAM",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Nikhil Keetha et al.",
+"contribution": "First dense RGB-D SLAM system to use explicit 3D Gaussian Splatting as its volumetric map representation, achieving up to 2× superior camera pose estimation, high-fidelity 3D reconstruction, and novel-view synthesis at 400 FPS through silhouette-guided differentiable rendering.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Keetha_SplaTAM_Splat_Track__Map_3D_Gaussians_for_Dense_RGB-D_CVPR_2024_paper.pdf",
+"code": "https://spla-tam.github.io",
+"note": "CVPR2024/papers/CVPR20241810.md",
+"built_on_by": 14
+},
+"CVPR20241842": {
+"title": "SC-GS: Sparse-Controlled Gaussian Splatting for Editable Dynamic Scenes",
+"short": "SC-GS",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Yi-Hua Huang et al.",
+"contribution": "A sparse control point representation (~512 points with time-varying 6-DoF transformations from a deformation MLP) that drives ~100K 3D Gaussians via linear blend skinning with ARAP rigidity regularization, achieving SOTA dynamic novel view synthesis (43.31 PSNR on D-NeRF) while enabling appearance-preserved motion editing through ARAP-based control graph deformation.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Huang_SC-GS_Sparse-Controlled_Gaussian_Splatting_for_Editable_Dynamic_Scenes_CVPR_2024_paper.pdf",
+"code": null,
+"note": "CVPR2024/papers/CVPR20241842.md",
+"built_on_by": 13
+},
+"CVPR20242189": {
+"title": "Deformable 3D Gaussians for High-Fidelity Monocular Dynamic Scene Reconstruction",
+"short": "Deformable 3D Gaussians for High-Fidelity ...",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Ziyi Yang et al.",
+"contribution": "Extends 3D Gaussian Splatting to monocular dynamic scenes by learning time-independent Gaussians in canonical space with a deformation MLP that outputs per-Gaussian offsets, combined with an annealing smooth training mechanism to mitigate pose-induced jitter, achieving state-of-the-art rendering quality (up to 44.62 PSNR on D-NeRF) at real-time speeds (>30 FPS).",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Yang_Deformable_3D_Gaussians_for_High-Fidelity_Monocular_Dynamic_Scene_Reconstruction_CVPR_2024_paper.pdf",
+"code": "https://github.com/ingra14m/Deformable-3D-Gaussians",
+"note": "CVPR2024/papers/CVPR20242189.md",
+"built_on_by": 36
+},
+"CVPR20242220": {
+"title": "SuGaR: Surface-Aligned Gaussian Splatting for Efficient 3D Mesh Reconstruction and High-Quality Mesh Rendering",
+"short": "SuGaR",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Antoine Guédon et al.",
+"contribution": "A surface-alignment regularization term for 3D Gaussian Splatting combined with a Poisson-reconstruction-based mesh extraction pipeline (sampling level-set points from Gaussian depth maps) that recovers an accurate, editable 3D triangle mesh from a 3DGS scene in minutes on a single GPU, with an optional joint refinement stage binding flat Gaussians to mesh triangles that achieves higher rendering quality than prior mesh-based methods (BakedSDF, NeRFMeshing, Mobile-NeRF) while enabling traditional mesh editing, animation, and compositing.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Guedon_SuGaR_Surface-Aligned_Gaussian_Splatting_for_Efficient_3D_Mesh_Reconstruction_and_CVPR_2024_paper.pdf",
+"code": "https://anttwo.github.io/sugar/",
+"note": "CVPR2024/papers/CVPR20242220.md",
+"built_on_by": 13
+},
+"CVPR20242275": {
+"title": "Compact 3D Gaussian Representation for Radiance Field",
+"short": "Compact 3D Gaussian Representation for ...",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Joo Chan Lee et al.",
+"contribution": "A compact 3D Gaussian representation framework that jointly reduces Gaussian count via learnable volume-based masking, replaces per-Gaussian spherical harmonics with a shared hash-grid neural field for view-dependent color, and encodes scale and rotation via residual vector quantization codebooks, achieving over 25× storage reduction and faster rendering while maintaining or improving reconstruction quality compared to 3DGS.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Lee_Compact_3D_Gaussian_Representation_for_Radiance_Field_CVPR_2024_paper.pdf",
+"code": "https://maincold2.github.io/c3dgs/",
+"note": "CVPR2024/papers/CVPR20242275.md",
+"built_on_by": 5
+},
+"CVPR20242478": {
+"title": "Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering",
+"short": "Scaffold-GS",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Tao Lu et al.",
+"contribution": "Introduces Scaffold-GS, a hierarchical 3D Gaussian representation where anchor points on a sparse voxel grid spawn local neural Gaussians whose attributes (opacity, color, scale, rotation) are decoded on-the-fly by small view-dependent MLPs, achieving comparable or superior rendering quality to 3D-GS with 4–10× less storage and similar real-time speed.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Lu_Scaffold-GS_Structured_3D_Gaussians_for_View-Adaptive_Rendering_CVPR_2024_paper.pdf",
+"code": "https://city-super.github.io/scaffold-gs/",
+"note": "CVPR2024/papers/CVPR20242478.md",
+"built_on_by": 50
+},
+"CVPR20242666": {
+"title": "Spacetime Gaussian Feature Splatting for Real-Time Dynamic View Synthesis",
+"short": "Spacetime Gaussian Feature Splatting for ...",
+"venue": "CVPR'24",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2024",
+"authors": "Zhan Li et al.",
+"contribution": "Proposes Spacetime Gaussian Feature Splatting, a dynamic scene representation that extends 3D Gaussians with temporal opacity and polynomial motion/rotation, replaces spherical harmonics with compact 9-dimensional neural features decoded by a 2-layer MLP, and adds guided sampling, achieving state-of-the-art 140 FPS rendering at 1352×1014 with a compact ~200 MB model for 300 frames and 8K 6-DoF video at 66 FPS on a single RTX 4090.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2024/papers/Li_Spacetime_Gaussian_Feature_Splatting_for_Real-Time_Dynamic_View_Synthesis_CVPR_2024_paper.pdf",
+"code": "https://oppo-us-research.github.io/SpacetimeGaussians-website/",
+"note": "CVPR2024/papers/CVPR20242666.md",
+"built_on_by": 8
+},
+"CVPR20250184": {
+"title": "Structured 3D Latents for Scalable and Versatile 3D Generation",
+"short": "Structured 3D Latents for Scalable ...",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Jianfeng Xiang et al.",
+"contribution": "Introduces SLAT, a unified structured latent representation that anchors dense DINOv2 multiview image features onto a sparse 3D voxel grid, enabling a single rectified-flow transformer pipeline (TRELLIS, up to 2B parameters) to generate high-quality 3D assets decodable into multiple formats (3D Gaussians, Radiance Fields, meshes) from text or image prompts, significantly outperforming prior methods on both appearance and geometry fidelity.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Xiang_Structured_3D_Latents_for_Scalable_and_Versatile_3D_Generation_CVPR_2025_paper.pdf",
+"code": "https://trellis3d.github.io",
+"note": "CVPR2025/papers/CVPR20250184.md",
+"built_on_by": 80
+},
+"CVPR20250750": {
+"title": "VGGT: Visual Geometry Grounded Transformer",
+"short": "VGGT",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Jianyuan Wang et al.",
+"contribution": "A large feed-forward transformer (VGGT) with minimal 3D inductive biases that predicts all key 3D scene attributes—camera parameters, depth maps, point maps, and 3D point tracks—from one to hundreds of images in a single forward pass, outperforming optimization-based methods by a wide margin while running 30–50× faster.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_VGGT_Visual_Geometry_Grounded_Transformer_CVPR_2025_paper.pdf",
+"code": "https://github.com/facebookresearch/vggt",
+"note": "CVPR2025/papers/CVPR20250750.md",
+"built_on_by": 172
+},
+"CVPR20251147": {
+"title": "DIFIX3D+: Improving 3D Reconstructions with Single-Step Diffusion Models",
+"short": "DIFIX3D+",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Jay Zhangjie Wu et al.",
+"contribution": "DIFIX3D+ introduces DIFIX, a single-step diffusion model fine-tuned from SD-Turbo that removes NeRF/3DGS rendering artifacts, deployed both during training via progressive 3D updates and at inference as a real-time (76 ms) neural enhancer, achieving ~2× FID improvement over baselines while maintaining multi-view 3D consistency across both implicit and explicit representations.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Wu_DIFIX3D_Improving_3D_Reconstructions_with_Single-Step_Diffusion_Models_CVPR_2025_paper.pdf",
+"code": "https://research.nvidia.com/labs/toronto-ai/difix3d",
+"note": "CVPR2025/papers/CVPR20251147.md",
+"built_on_by": 6
+},
+"CVPR20251482": {
+"title": "Speedy-Splat: Fast 3D Gaussian Splatting with Sparse Pixels and Sparse Primitives",
+"short": "Speedy-Splat",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Alex Hanson et al.",
+"contribution": "Speedy-Splat combines precise elliptical tile-intersection methods (SnugBox and AccuTile) with an efficient 36×-memory-reduced pruning score integrated into the 3D-GS training pipeline (Soft and Hard Pruning), achieving a 6.71× rendering speedup and 10.6× model size reduction while maintaining competitive image quality across Mip-NeRF 360, Tanks & Temples, and Deep Blending datasets.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Hanson_Speedy-Splat_Fast_3D_Gaussian_Splatting_with_Sparse_Pixels_and_Sparse_CVPR_2025_paper.pdf",
+"code": "https://speedysplat.github.io/",
+"note": "CVPR2025/papers/CVPR20251482.md",
+"built_on_by": 5
+},
+"CVPR20251618": {
+"title": "Textured Gaussians for Enhanced 3D Scene Appearance Modeling",
+"short": "Textured Gaussians for Enhanced 3D ...",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Brian Chao et al.",
+"contribution": "Augments 3D Gaussian Splatting with per-Gaussian 2D texture maps (alpha, RGB, or RGBA) projected onto each Gaussian's major-axis plane, enabling spatially varying color and opacity that significantly improves novel-view synthesis quality—particularly at reduced Gaussian budgets—while revealing that alpha-only textures outperform RGB textures at the same model size.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Chao_Textured_Gaussians_for_Enhanced_3D_Scene_Appearance_Modeling_CVPR_2025_paper.pdf",
+"code": "https://textured-gaussians.github.io",
+"note": "CVPR2025/papers/CVPR20251618.md",
+"built_on_by": 1
+},
+"CVPR20251661": {
+"title": "DropGaussian: Structural Regularization for Sparse-view Gaussian Splatting",
+"short": "DropGaussian",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Hyunwoo Park et al.",
+"contribution": "DropGaussian, a prior-free structural regularization that randomly removes 3D Gaussians during training with a progressive schedule (analogous to dropout), mitigates overfitting in sparse-view 3D Gaussian Splatting and achieves competitive performance with prior-based methods without any additional modules or computational cost.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Park_DropGaussian_Structural_Regularization_for_Sparse-view_Gaussian_Splatting_CVPR_2025_paper.pdf",
+"code": "https://github.com/DCVL-3D/DropGaussian_release",
+"note": "CVPR2025/papers/CVPR20251661.md",
+"built_on_by": 4
+},
+"CVPR20252072": {
+"title": "Geometry Field Splatting with Gaussian Surfels",
+"short": "Geometry Field Splatting with Gaussian ...",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Kaiwen Jiang et al.",
+"contribution": "Parameterizes a stochastic geometry field with 2D Gaussian surfels and derives an almost-exact differentiable volume splatting algorithm (removing Taylor-series and self-occlusion approximations), combined with a color-blending mechanism that guarantees a continuous loss landscape when surfels cluster, achieving state-of-the-art geometry reconstruction on DTU and BlendedMVS.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Jiang_Geometry_Field_Splatting_with_Gaussian_Surfels_CVPR_2025_paper.pdf",
+"code": null,
+"note": "CVPR2025/papers/CVPR20252072.md",
+"built_on_by": 0
+},
+"CVPR20252405": {
+"title": "4D LangSplat: 4D Language Gaussian Splatting via Multimodal Large Language Models",
+"short": "4D LangSplat",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Wanhua Li et al.",
+"contribution": "First method to construct 4D language Gaussian fields by learning time-varying semantic features from MLLM-generated object-level video captions (bypassing vision features) and a status deformable network that constrains semantic transitions to convex combinations of learned state prototypes, enabling both time-agnostic and time-sensitive open-vocabulary queries in dynamic scenes.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Li_4D_LangSplat_4D_Language_Gaussian_Splatting_via_Multimodal_Large_Language_CVPR_2025_paper.pdf",
+"code": "https://4d-langsplat.github.io/",
+"note": "CVPR2025/papers/CVPR20252405.md",
+"built_on_by": 3
+},
+"CVPR20252439": {
+"title": "DepthSplat: Connecting Gaussian Splatting and Depth",
+"short": "DepthSplat",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Haofei Xu et al.",
+"contribution": "DepthSplat connects Gaussian splatting and depth estimation by augmenting multi-view cost volumes with pre-trained monocular depth features (Depth Anything V2) for more robust depth prediction, and by using the differentiable Gaussian splatting rendering loss as an unsupervised pre-training objective for depth models on large-scale posed multi-view datasets, achieving state-of-the-art results on both depth estimation and novel view synthesis across ScanNet, RealEstate10K, and DL3DV.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Xu_DepthSplat_Connecting_Gaussian_Splatting_and_Depth_CVPR_2025_paper.pdf",
+"code": "https://github.com/cvg/depthsplat",
+"note": "CVPR2025/papers/CVPR20252439.md",
+"built_on_by": 5
+},
+"CVPR20252444": {
+"title": "MoSca: Dynamic Gaussian Fusion from Casual Videos via 4D Motion Scaffolds",
+"short": "MoSca",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Jiahui Lei et al.",
+"contribution": "Introduces 4D Motion Scaffolds (MoSca), a sparse SE(3) trajectory graph with Dual Quaternion Blending that lifts 2D foundation model priors into a compact 3D deformation field, enabling globally fused 3D Gaussian Splatting to reconstruct and render dynamic scenes from pose-free monocular casual videos with state-of-the-art performance on DyCheck (19.32 mPSNR, ~2 dB over prior SOTA).",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Lei_MoSca_Dynamic_Gaussian_Fusion_from_Casual_Videos_via_4D_Motion_CVPR_2025_paper.pdf",
+"code": "https://www.cis.upenn.edu/~leijh/projects/mosca",
+"note": "CVPR2025/papers/CVPR20252444.md",
+"built_on_by": 13
+},
+"CVPR20252768": {
+"title": "FreeTimeGS: Free Gaussian Primitives at Anytime Anywhere for Dynamic Scene Reconstruction",
+"short": "FreeTimeGS",
+"venue": "CVPR'25",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2025",
+"authors": "Yifan Wang et al.",
+"contribution": "Proposes FreeTimeGS, a 4D Gaussian representation that allows primitives to appear at arbitrary positions and time steps with a linear motion function and Gaussian-shaped temporal opacity, achieving state-of-the-art dynamic novel view synthesis (2.4 dB PSNR gain over 4DGS on fast-motion scenes) at 450+ FPS real-time rendering.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_FreeTimeGS_Free_Gaussian_Primitives_at_Anytime_Anywhere_for_Dynamic_Scene_CVPR_2025_paper.pdf",
+"code": null,
+"note": "CVPR2025/papers/CVPR20252768.md",
+"built_on_by": 4
+},
+"CVPR20261262": {
+"title": "PhysGaia: A Physics-aware Benchmark with Multi-Body Interactions for Dynamic Novel View Synthesis",
+"short": "PhysGaia",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Mijeong Kim et al.",
+"contribution": "Introduces PhysGaia, a physics-aware benchmark of 17 simulated scenes with multi-body interactions across liquid, gas, textile, and rheological materials, providing ground-truth 3D particle trajectories and physical parameters along with novel metrics (Trajectory Distance and AUOP) to quantitatively evaluate physical realism in Dynamic Novel View Synthesis, and demonstrates that state-of-the-art 4DGS methods achieve photorealism but fail to follow physically plausible motion.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Kim_PhysGaia_A_Physics-aware_Benchmark_with_Multi-Body_Interactions_for_Dynamic_Novel_CVPR_2026_paper.pdf",
+"code": "https://cv.snu.ac.kr/research/PhysGaia/",
+"note": "CVPR2026/papers/CVPR20261262.md",
+"built_on_by": 0
+},
+"CVPR20261737": {
+"title": "MoVieS: Motion-Aware 4D Dynamic View Synthesis in One Second",
+"short": "MoVieS",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Chenguo Lin et al.",
+"contribution": "Introduces MoVieS, a feed-forward 4D dynamic view synthesis model that jointly models appearance, geometry, and motion from monocular videos using dynamic splatter pixels (3D Gaussians with time-conditioned deformation fields), achieving competitive reconstruction quality in under 1 second per scene—orders of magnitude faster than optimization-based methods—while enabling zero-shot scene flow estimation and moving object segmentation.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Lin_MoVieS_Motion-Aware_4D_Dynamic_View_Synthesis_in_One_Second_CVPR_2026_paper.pdf",
+"code": "https://chenguolin.github.io/projects/MoVieS",
+"note": "CVPR2026/papers/CVPR20261737.md",
+"built_on_by": 0
+},
+"CVPR20262066": {
+"title": "ST4R-Splat: Spatio-Temporal Referring Segmentation in 4D Gaussian Splatting",
+"short": "ST4R-Splat",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Yuming Meng et al.",
+"contribution": "Introduces the novel task of Spatio-Temporal Referring Segmentation in 4D Gaussian Splatting (STRS-4DGS) and proposes ST4R-Splat, the first framework to solve it by decoupling spatial instance grounding (Instance-Aware 4D Gaussian Referring Field with cross-modal attention) from view-independent temporal state localization (instance-to-state feature cache), achieving 77.67% mIoU and 83.44% temporal accuracy on a newly constructed benchmark, substantially outperforming adapted 3D referring and 4D open-vocabulary baselines.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Meng_ST4R-Splat_Spatio-Temporal_Referring_Segmentation_in_4D_Gaussian_Splatting_CVPR_2026_paper.pdf",
+"code": null,
+"note": "CVPR2026/papers/CVPR20262066.md",
+"built_on_by": 0
+},
+"CVPR20262098": {
+"title": "Off The Grid: Detection of Primitives for Feed-Forward 3D Gaussian Splatting",
+"short": "Off The Grid",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Arthur Moreau et al.",
+"contribution": "A pose-free feed-forward 3DGS architecture that detects Gaussian primitives at sub-pixel resolution via DSNT heatmaps with adaptive density allocation (16/32/64 per patch by Shannon entropy) and confidence-based multi-view pruning, achieving state-of-the-art novel view synthesis (21.21 PSNR) while using 7× fewer primitives than pixel-aligned baselines.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Moreau_Off_The_Grid_Detection_of_Primitives_for_Feed-Forward_3D_Gaussian_CVPR_2026_paper.pdf",
+"code": "https://arthurmoreau.github.io/OffTheGrid/",
+"note": "CVPR2026/papers/CVPR20262098.md",
+"built_on_by": 0
+},
+"CVPR20262382": {
+"title": "FastGS: Training 3D Gaussian Splatting in 100 Seconds",
+"short": "FastGS",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Shiwei Ren et al.",
+"contribution": "A general 3DGS acceleration framework (FastGS) that replaces Gaussian-associated proxy scores with multi-view consistent densification and pruning driven by per-pixel L1 loss maps, achieving ~100-second training with comparable rendering quality and 2–6× speedups across dynamic, surface, sparse-view, large-scale, and SLAM tasks.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Ren_FastGS_Training_3D_Gaussian_Splatting_in_100_Seconds_CVPR_2026_paper.pdf",
+"code": "https://fastgs.github.io/",
+"note": "CVPR2026/papers/CVPR20262382.md",
+"built_on_by": 1
+},
+"CVPR20263070": {
+"title": "Consistent Instance Field for Dynamic Scene Understanding",
+"short": "Consistent Instance Field for Dynamic ...",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Junyi Wu et al.",
+"contribution": "Introduces Consistent Instance Field (CIF), a probabilistic 4D spatio-temporal representation that disentangles object occupancy from persistent instance identity in deformable 3D Gaussians, achieving +11.4 mIoU over prior SOTA on HyperNeRF and +5.8 mIoU on Neu3D for novel-view panoptic segmentation through visibility-bias calibration and instance-guided Gaussian resampling.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Wu_Consistent_Instance_Field_for_Dynamic_Scene_Understanding_CVPR_2026_paper.pdf",
+"code": null,
+"note": "CVPR2026/papers/CVPR20263070.md",
+"built_on_by": 0
+},
+"CVPR20263296": {
+"title": "Stochastic Ray Tracing for the Reconstruction of 3D Gaussian Splatting",
+"short": "Stochastic Ray Tracing for the ...",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Peiyu Xu et al.",
+"contribution": "A differentiable, sorting-free stochastic Monte Carlo estimator for pixel-color gradients in ray-traced 3D Gaussian Splatting that matches rasterization-based 3DGS speed while retaining full ray-tracing generality, and extends naturally to relightable scenes via exact stochastic shadow-ray evaluation, substantially outperforming both sorting-based ray tracing and shadow-mapping-based relighting baselines.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Xu_Stochastic_Ray_Tracing_for_the_Reconstruction_of_3D_Gaussian_Splatting_CVPR_2026_paper.pdf",
+"code": null,
+"note": "CVPR2026/papers/CVPR20263296.md",
+"built_on_by": 0
+},
+"CVPR20263765": {
+"title": "Revisiting 3D Reconstruction Kernels as Low-Pass Filters",
+"short": "Revisiting 3D Reconstruction Kernels as ...",
+"venue": "CVPR'26",
+"venue_long": "IEEE/CVF Conference on Computer Vision and Pattern Recognition 2026",
+"authors": "Shengjun Zhang et al.",
+"contribution": "Reframes 3D reconstruction kernels as low-pass filters via signal processing analysis, proposes the Jinc kernel (inverse Fourier transform of the 3D ideal low-pass filter) with a complete rasterization pipeline including closed-form ray integrals and analytic gradients, and introduces a frequency modulation strategy that preserves the spatial efficiency of Gaussian and Student's t kernels while approximating ideal spectral cutoff, yielding consistent PSNR/SSIM/LPIPS gains across Mip-NeRF360, Tanks & Temples, and Deep Blending.",
+"pdf": "https://openaccess.thecvf.com/content/CVPR2026/papers/Zhang_Revisiting_3D_Reconstruction_Kernels_as_Low-Pass_Filters_CVPR_2026_paper.pdf",
+"code": null,
+"note": "CVPR2026/papers/CVPR20263765.md",
+"built_on_by": 0
+},
+"ECCV20240081": {
+"title": "LGM: Large Multi-View Gaussian Model for High-Resolution 3D Content Creation",
+"short": "LGM",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Jiaxiang Tang et al.",
+"contribution": "Introduces LGM, an asymmetric U-Net with cross-view self-attention that predicts 65,536 3D Gaussians from four multi-view images (synthesized by diffusion models), enabling high-resolution (512×512) feed-forward 3D generation in ~5 seconds by replacing the transformer + triplane NeRF paradigm with a U-Net + Gaussian splatting architecture.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/00465.pdf",
+"code": "https://me.kiui.moe/lgm/",
+"note": "ECCV2024/papers/ECCV20240081.md",
+"built_on_by": 18
+},
+"ECCV20240185": {
+"title": "HAC: Hash-grid Assisted Context for 3D Gaussian Splatting Compression",
+"short": "HAC",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Yihang Chen et al.",
+"contribution": "First context-based compression framework for 3D Gaussian Splatting that exploits a structured binary hash grid to model spatial consistencies among Scaffold-GS anchors, enabling entropy coding of anchor attributes and achieving over 75× size reduction vs. vanilla 3DGS and over 11× vs. Scaffold-GS with comparable or improved rendering fidelity.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/01178.pdf",
+"code": null,
+"note": "ECCV2024/papers/ECCV20240185.md",
+"built_on_by": 3
+},
+"ECCV20240395": {
+"title": "Per-Gaussian Embedding-Based Deformation for Deformable 3D Gaussian Splatting",
+"short": "Per-Gaussian Embedding-Based Deformation for Deformable ...",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Jeongmin Bae et al.",
+"contribution": "Replaces coordinate-based deformation fields in deformable 3D Gaussian Splatting with per-Gaussian latent embeddings combined with coarse-fine temporal decomposition and local smoothness regularization, achieving superior reconstruction quality (PSNR 31.31 on Neural 3D Video) at real-time speed (74.5 FPS) and compact model size (35 MB) compared to prior methods.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/02361.pdf",
+"code": "https://jeongminb.github.io/e-d3dgs/",
+"note": "ECCV2024/papers/ECCV20240395.md",
+"built_on_by": 4
+},
+"ECCV20240557": {
+"title": "MVSplat: Efficient 3D Gaussian Splatting from Sparse Multi-View Images",
+"short": "MVSplat",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Yuedong Chen et al.",
+"contribution": "MVSplat introduces a cost-volume-based feed-forward 3D Gaussian Splatting model that reformulates Gaussian center localization as a multi-view feature-matching problem via plane sweeping, achieving state-of-the-art novel view synthesis with 10× fewer parameters and >2× faster inference than pixelSplat while delivering superior appearance, geometry quality, and cross-dataset generalization.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/03187.pdf",
+"code": "https://github.com/donydchen/mvsplat",
+"note": "ECCV2024/papers/ECCV20240557.md",
+"built_on_by": 24
+},
+"ECCV20240564": {
+"title": "GS-LRM: Large Reconstruction Model for 3D Gaussian Splatting",
+"short": "GS-LRM",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Kai Zhang et al.",
+"contribution": "A simple transformer-based large reconstruction model that predicts per-pixel 3D Gaussian Splatting parameters directly from 2–4 posed sparse images, achieving state-of-the-art feed-forward reconstruction for both objects (30.52 dB PSNR on GSO) and scenes (28.10 dB PSNR on RealEstate10K) in ~0.23 s on a single A100 GPU, without any 3D geometric inductive bias.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/03212.pdf",
+"code": "https://sai-bi.github.io/project/gs-lrm/",
+"note": "ECCV2024/papers/ECCV20240564.md",
+"built_on_by": 15
+},
+"ECCV20240762": {
+"title": "Gaussian Grouping: Segment and Edit Anything in 3D Scenes",
+"short": "Gaussian Grouping",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Mingqiao Ye et al.",
+"contribution": "Extends 3D Gaussian Splatting with a compact 16-dimensional per-Gaussian Identity Encoding supervised by SAM 2D masks and 3D spatial consistency regularization, enabling joint scene reconstruction and open-world 'anything' segmentation with negligible quality loss (PSNR drop of 0.26 dB) and supporting efficient composable local scene editing including removal, inpainting, colorization, style transfer, and recomposition.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/04195.pdf",
+"code": "https://github.com/lkeab/gaussian-grouping",
+"note": "ECCV2024/papers/ECCV20240762.md",
+"built_on_by": 6
+},
+"ECCV20241031": {
+"title": "FSGS: Real-Time Few-shot View Synthesis using Gaussian Splatting",
+"short": "FSGS",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Zehao Zhu et al.",
+"contribution": "A few-shot novel view synthesis framework (FSGS) that replaces 3D Gaussian Splatting's gradient-based densification with Proximity-guided Gaussian Unpooling and adds pseudo-view monocular depth regularization, achieving real-time rendering (200+ FPS) from as few as 3 views while outperforming both NeRF-based few-shot methods and standard 3D-GS in rendering quality.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/05583.pdf",
+"code": "https://zehaozhu.github.io/FSGS/",
+"note": "ECCV2024/papers/ECCV20241031.md",
+"built_on_by": 9
+},
+"ECCV20241948": {
+"title": "Street Gaussians: Modeling Dynamic Urban Scenes with Gaussian Splatting",
+"short": "Street Gaussians",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Yunzhi Yan et al.",
+"contribution": "Introduces Street Gaussians, an explicit 3D Gaussian-based scene representation for dynamic urban streets that decomposes the scene into a static background and per-vehicle foreground models with optimizable tracked poses and a 4D spherical harmonics appearance model, achieving state-of-the-art rendering quality (PSNR 34.61 on Waymo) at 135 FPS within 30 minutes of training—over 100× faster than prior NeRF-based methods.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/09243.pdf",
+"code": null,
+"note": "ECCV2024/papers/ECCV20241948.md",
+"built_on_by": 6
+},
+"ECCV20242056": {
+"title": "Mini-Splatting: Representing Scenes with a Constrained Number of Gaussians",
+"short": "Mini-Splatting",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Guangchi Fang et al.",
+"contribution": "Identifies that the inefficient spatial distribution of 3D Gaussians (overlapping and under-reconstruction) is the primary bottleneck in 3DGS, and proposes a densification-then-simplification pipeline (blur split + depth reinitialization followed by intersection preserving + importance-weighted sampling) that achieves ~7× fewer Gaussians with comparable rendering quality and significantly reduced resource consumption.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/09866.pdf",
+"code": null,
+"note": "ECCV2024/papers/ECCV20242056.md",
+"built_on_by": 4
+},
+"ECCV20242381": {
+"title": "GS2Mesh: Surface Reconstruction from Gaussian Splatting via Novel Stereo Views",
+"short": "GS2Mesh",
+"venue": "ECCV'24",
+"venue_long": "European Conference on Computer Vision 2024",
+"authors": "Yaniv Wolf et al.",
+"contribution": "A novel surface reconstruction pipeline that renders stereo-aligned novel view pairs from a 3DGS model, applies a pre-trained stereo matching network (DLNR) as a zero-shot geometric prior to extract depth, and fuses the resulting depth profiles via TSDF to produce smooth, accurate meshes in ~20 minutes—outperforming all GS-based methods on DTU (0.68 Chamfer Distance) and Tanks and Temples (0.37 F1) while matching neural methods at 36× lower compute cost.",
+"pdf": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/12486.pdf",
+"code": "https://gs2mesh.github.io",
+"note": "ECCV2024/papers/ECCV20242381.md",
+"built_on_by": 0
+},
+"ECCV20261520": {
+"title": "DLGStream: Dynamic Language-embedded Gaussian Splatting for Open-vocabulary Enabled Free-viewpoint Video Streaming",
+"short": "DLGStream",
+"venue": "ECCV'26",
+"venue_long": "European Conference on Computer Vision 2026",
+"authors": "Zhihui Ke et al.",
+"contribution": "Proposes DLGStream, a language-embedded free-viewpoint video representation that uses dual-opacity Gaussian splatting (separate opacity for color and language features) and an interpolation-based deformation field to enable 4D open-vocabulary queries at 43 KB average frame size and 100+ FPS, resolving the joint-optimization degradation and temporal redundancy that made prior language Gaussian methods impractical for streaming.",
+"pdf": "https://media.eventhosts.cc/Conferences/ECCV2026/pdfs/6927.pdf",
+"code": "https://github.com/kkkzh/DLGStream",
+"note": "ECCV2026/papers/ECCV20261520.md",
+"built_on_by": 0
+},
+"ECCV20261764": {
+"title": "KineticGS: Momentum-driven Coherent 4D Gaussian Splatting for Monocular Dynamic Scene Reconstruction",
+"short": "KineticGS",
+"venue": "ECCV'26",
+"venue_long": "European Conference on Computer Vision 2026",
+"authors": "Yunqing Wang et al.",
+"contribution": "Proposes KineticGS, a momentum-driven 4D Gaussian Splatting method that models Gaussian primitives as momentum-carrying particles organized in a three-level hierarchy (energy-weighted sampling, learnable temporal activation, and space-filling-curve-based kinetic synchronization), achieving +0.91 dB PSNR improvement in dynamic-object regions over the second-best method for monocular dynamic scene reconstruction.",
+"pdf": "https://media.eventhosts.cc/Conferences/ECCV2026/pdfs/7978.pdf",
+"code": null,
+"note": "ECCV2026/papers/ECCV20261764.md",
+"built_on_by": 0
+},
+"ECCV20261811": {
+"title": "KISS-GS: 3D Gaussian Splatting Compression Kept Simple",
+"short": "KISS-GS",
+"venue": "ECCV'26",
+"venue_long": "European Conference on Computer Vision 2026",
+"authors": "Wieland Morgenstern et al.",
+"contribution": "A modular 3DGS compression pipeline (KISS-GS) that decouples compaction (POPSpa), image-based encoding (SOG-XT with self-organizing 2D codebooks and PRAS covariance smoothing), and optional encoding-aware fine-tuning into independently replaceable stages, achieving 85×–319× file-size reduction over vanilla 3DGS while restricting the decoder to standard web-native image formats.",
+"pdf": "https://media.eventhosts.cc/Conferences/ECCV2026/pdfs/8201.pdf",
+"code": "https://fraunhoferhhi.github.io/KISS-GS/",
+"note": "ECCV2026/papers/ECCV20261811.md",
+"built_on_by": 0
+},
+"ECCV20262102": {
+"title": "GlobalSplat: Efficient Feed-Forward 3D Gaussian Splatting via Global Scene Tokens",
+"short": "GlobalSplat",
+"venue": "ECCV'26",
+"venue_long": "European Conference on Computer Vision 2026",
+"authors": "Roni Itkin et al.",
+"contribution": "Introduces GlobalSplat, a feed-forward 3D Gaussian Splatting framework that fuses all input views into a fixed set of 2048 global latent scene tokens via a dual-branch iterative-attention encoder before decoding explicit 3D Gaussians, achieving near-parity PSNR with ZPressor (28.53 vs. 28.51 at 24 views) while using 24× fewer Gaussians (16K vs. 393K), a 3.8 MB on-disk footprint, 1.79 GB peak memory, and 78 ms inference.",
+"pdf": "https://media.eventhosts.cc/Conferences/ECCV2026/pdfs/9617.pdf",
+"code": null,
+"note": "ECCV2026/papers/ECCV20262102.md",
+"built_on_by": 0
+},
+"ICCV20251202": {
+"title": "LHM: Large Animatable Human Reconstruction Model for Single Image to 3D in Seconds",
+"short": "LHM",
+"venue": "ICCV'25",
+"venue_long": "IEEE/CVF International Conference on Computer Vision 2025",
+"authors": "Lingteng Qiu et al.",
+"contribution": "A feed-forward multimodal transformer (LHM) that reconstructs animatable 3D human avatars as Gaussian splatting from a single image in seconds, using a body-head attention architecture with head feature pyramid encoding and self-supervised training on in-the-wild video, achieving state-of-the-art reconstruction and animation quality without per-instance optimization or 3D scan ground truth.",
+"pdf": "https://openaccess.thecvf.com/content/ICCV2025/papers/Qiu_LHM_Large_Animatable_Human_Reconstruction_Model_for_Single_Image_to_ICCV_2025_paper.pdf",
+"code": "https://github.com/aigc3d/LHM",
+"note": "ICCV2025/papers/ICCV20251202.md",
+"built_on_by": 8
+},
+"ICCV20251524": {
+"title": "4D Gaussian Splatting SLAM",
+"short": "4D Gaussian Splatting SLAM",
+"venue": "ICCV'25",
+"venue_long": "IEEE/CVF International Conference on Computer Vision 2025",
+"authors": "Yanyan Li et al.",
+"contribution": "First 4D Gaussian Splatting SLAM system that simultaneously tracks camera poses and reconstructs dynamic scenes by splitting Gaussians into static/dynamic sets, modeling dynamic deformation via sparse control points with an MLP, and introducing a novel 2D optical flow rendering algorithm as dense motion supervision, achieving 3.6 cm average ATE and 23.66 dB PSNR on the BONN dynamic dataset.",
+"pdf": "https://openaccess.thecvf.com/content/ICCV2025/papers/Li_4D_Gaussian_Splatting_SLAM_ICCV_2025_paper.pdf",
+"code": "https://github.com/yanyan-li/4DGS-SLAM",
+"note": "ICCV2025/papers/ICCV20251524.md",
+"built_on_by": 1
+},
+"ICCV20251580": {
+"title": "Shape of Motion: 4D Reconstruction from a Single Video",
+"short": "Shape of Motion",
+"venue": "ICCV'25",
+"venue_long": "IEEE/CVF International Conference on Computer Vision 2025",
+"authors": "Qianqian Wang et al.",
+"contribution": "A 4D scene representation using persistent 3D Gaussians with shared SE(3) motion bases that jointly achieves state-of-the-art long-range 3D tracking, 2D tracking, and novel view synthesis from a single casually captured monocular video by consolidating noisy off-the-shelf depth and 2D-track priors into a globally coherent representation.",
+"pdf": "https://openaccess.thecvf.com/content/ICCV2025/papers/Wang_Shape_of_Motion_4D_Reconstruction_from_a_Single_Video_ICCV_2025_paper.pdf",
+"code": "https://shape-of-motion.github.io/",
+"note": "ICCV2025/papers/ICCV20251580.md",
+"built_on_by": 13
+},
+"ICCV20251589": {
+"title": "GUAVA: Generalizable Upper Body 3D Gaussian Avatar",
+"short": "GUAVA",
+"venue": "ICCV'25",
+"venue_long": "IEEE/CVF International Conference on Computer Vision 2025",
+"authors": "Dongbin Zhang et al.",
+"contribution": "First framework for generalizable upper-body 3D Gaussian avatar reconstruction from a single image, combining an expressive human model (EHM: SMPLX+FLAME fusion), inverse texture mapping for UV-space Gaussians, and a neural refiner to achieve sub-second (~98 ms) feed-forward reconstruction with real-time (~50 FPS) animation and rendering.",
+"pdf": "https://openaccess.thecvf.com/content/ICCV2025/papers/Zhang_GUAVA_Generalizable_Upper_Body_3D_Gaussian_Avatar_ICCV_2025_paper.pdf",
+"code": null,
+"note": "ICCV2025/papers/ICCV20251589.md",
+"built_on_by": 3
+},
+"ICCV20251851": {
+"title": "EVER: Exact Volumetric Ellipsoid Rendering for Real-time View Synthesis",
+"short": "EVER",
+"venue": "ICCV'25",
+"venue_long": "IEEE/CVF International Conference on Computer Vision 2025",
+"authors": "Alexander Mai et al.",
+"contribution": "EVER introduces a double-intersection ray-tracing method for exact volumetric rendering of constant-density ellipsoids, enabling physically accurate blending of unlimited overlapping primitives at real-time framerates (~30 FPS at 720p) and eliminating the popping artifacts inherent to 3D Gaussian Splatting, while matching or exceeding offline Zip-NeRF on perceptual quality (SSIM, LPIPS) for large-scale scenes.",
+"pdf": "https://openaccess.thecvf.com/content/ICCV2025/papers/Mai_EVER_Exact_Volumetric_Ellipsoid_Rendering_for_Real-time_View_Synthesis_ICCV_2025_paper.pdf",
+"code": null,
+"note": "ICCV2025/papers/ICCV20251851.md",
+"built_on_by": 3
+},
+"ICCV20252484": {
+"title": "Long-LRM: Long-sequence Large Reconstruction Model for Wide-coverage Gaussian Splats",
+"short": "Long-LRM",
+"venue": "ICCV'25",
+"venue_long": "IEEE/CVF International Conference on Computer Vision 2025",
+"authors": "Chen Ziwen et al.",
+"contribution": "Long-LRM is the first feed-forward 3D Gaussian splatting model to achieve instant (1-second) 360° wide-coverage scene-level reconstruction from 32 high-resolution (960×540) images by combining Mamba2 and transformer blocks in a hybrid architecture with token merging and Gaussian pruning, achieving PSNR comparable to 30K-step optimization-based 3D GS with an 800× speedup.",
+"pdf": "https://openaccess.thecvf.com/content/ICCV2025/papers/Ziwen_Long-LRM_Long-sequence_Large_Reconstruction_Model_for_Wide-coverage_Gaussian_Splats_ICCV_2025_paper.pdf",
+"code": "http://arthurhero.github.io/projects/llrm/",
+"note": "ICCV2025/papers/ICCV20252484.md",
+"built_on_by": 3
+},
+"ICLR20240365": {
+"title": "Real-Time Photorealistic Dynamic Scene Representation and Rendering with 4D Gaussian Splatting",
+"short": "Real-Time Photorealistic Dynamic Scene Representation ...",
+"venue": "ICLR'24",
+"venue_long": "International Conference on Learning Representations 2024",
+"authors": "Zeyu Yang et al.",
+"contribution": "Represents dynamic scenes as a collection of 4D Gaussians with full 4D rotation (parameterized by left and right isotropic quaternions) and 4D Spherindrical Harmonics for time-evolving view-dependent appearance, achieving the first real-time (114 FPS) end-to-end photorealistic novel view synthesis of complex dynamic scenes with volumetric effects.",
+"pdf": "https://proceedings.iclr.cc/paper_files/paper/2024/file/26230ff5299de0929d03ed3576c3bbf9-Paper-Conference.pdf",
+"code": "https://fudan-zvg.github.io/4d-gaussian-splatting",
+"note": "ICLR2024/papers/ICLR20240365.md",
+"built_on_by": 17
+},
+"ICLR20241330": {
+"title": "DreamGaussian: Generative Gaussian Splatting for Efficient 3D Content Creation",
+"short": "DreamGaussian",
+"venue": "ICLR'24",
+"venue_long": "International Conference on Learning Representations 2024",
+"authors": "Jiaxiang Tang et al.",
+"contribution": "Adapts 3D Gaussian Splatting into a generative SDS pipeline with progressive densification, a novel block-wise mesh extraction algorithm, and an SDEdit-inspired UV-space texture refinement stage, achieving ~10× speedup over NeRF-based methods (2 min vs. 20 min for image-to-3D) while producing ready-to-use textured polygonal meshes.",
+"pdf": "https://proceedings.iclr.cc/paper_files/paper/2024/file/905202e21386913d8eac637c2b50f590-Paper-Conference.pdf",
+"code": "https://dreamgaussian.github.io/",
+"note": "ICLR2024/papers/ICLR20241330.md",
+"built_on_by": 6
+},
+"ICLR20251940": {
+"title": "No Pose, No Problem: Surprisingly Simple 3D Gaussian Splats from Sparse Unposed Images",
+"short": "No Pose, No Problem",
+"venue": "ICLR'25",
+"venue_long": "International Conference on Learning Representations 2025",
+"authors": "Botao Ye et al.",
+"contribution": "NoPoSplat is a feed-forward ViT network that reconstructs 3D Gaussians directly in a canonical space from as few as two unposed images using photometric loss only, outperforming both pose-required SOTA (pixelSplat, MVSplat) and prior pose-free methods on novel view synthesis and relative pose estimation, particularly under limited view overlap.",
+"pdf": "https://proceedings.iclr.cc/paper_files/paper/2025/file/857b34d81f0a8bfe3e18879dee3b5086-Paper-Conference.pdf",
+"code": "https://noposplat.github.io",
+"note": "ICLR2025/papers/ICLR20251940.md",
+"built_on_by": 9
+},
+"ICLR20252162": {
+"title": "LVSM: A Large View Synthesis Model with Minimal 3D Inductive Bias",
+"short": "LVSM",
+"venue": "ICLR'25",
+"venue_long": "International Conference on Learning Representations 2025",
+"authors": "Haian Jin et al.",
+"contribution": "A transformer-based novel view synthesis model (LVSM) that eliminates all 3D inductive biases—including explicit representations (NeRF, 3DGS) and architectural priors (epipolar projections, plane-sweep volumes)—achieving state-of-the-art quality with 1.5–3.5 dB PSNR improvement over GS-LRM through two architectures: an encoder-decoder with learned latent scene tokens and a decoder-only variant that directly maps input to output views.",
+"pdf": "https://proceedings.iclr.cc/paper_files/paper/2025/file/9676c5283df26cabca412ca66b164a7d-Paper-Conference.pdf",
+"code": "https://haian-jin.github.io/projects/LVSM/",
+"note": "ICLR2025/papers/ICLR20252162.md",
+"built_on_by": 17
+},
+"ICLR20261363": {
+"title": "YoNoSplat: You Only Need One Model for Feedforward 3D Gaussian Splatting",
+"short": "YoNoSplat",
+"venue": "ICLR'26",
+"venue_long": "International Conference on Learning Representations 2026",
+"authors": "Botao Ye et al.",
+"contribution": "YoNoSplat is the first feedforward 3D Gaussian Splatting model that achieves state-of-the-art novel view synthesis in both pose-free and pose-dependent settings for an arbitrary number of views, enabled by a novel mix-forcing training strategy that resolves pose-geometry entanglement and a pairwise camera-distance normalization with Intrinsic Condition Embedding that eliminates scale ambiguity for uncalibrated inputs.",
+"pdf": "https://proceedings.iclr.cc/paper_files/paper/2026/file/42f92b78a6695f60db0cd38b54d57a41-Paper-Conference.pdf",
+"code": "https://botaoye.github.io/yonosplat/",
+"note": "ICLR2026/papers/ICLR20261363.md",
+"built_on_by": 0
+},
+"ICML20262652": {
+"title": "Revisiting Photometric Ambiguity for Accurate Gaussian-Splatting Surface Reconstruction",
+"short": "Revisiting Photometric Ambiguity for Accurate ...",
+"venue": "ICML'26",
+"venue_long": "International Conference on Machine Learning 2026",
+"authors": "Jiahe Li et al.",
+"contribution": "Identifies two intrinsic primitive-wise photometric ambiguities in Gaussian Splatting (edge overblowing and under-determined color blending) and proposes AmbiSuR, combining Gaussian Primitive Truncation, Ray-Color Consistency, and a Spherical Harmonics-based dual-end ambiguity indicator with an amorphous local regularizer, achieving state-of-the-art surface reconstruction on DTU, Tanks and Temples, and Mip-NeRF 360.",
+"pdf": "https://raw.githubusercontent.com/mlresearch/v306/main/assets/li26iz/li26iz.pdf",
+"code": "https://fictionarry.github.io/AmbiSuR-Proj/",
+"note": "ICML2026/papers/ICML20262652.md",
+"built_on_by": 0
+},
+"ICML20262881": {
+"title": "WorldMirror: Universal 3D World Reconstruction with Any-Prior Prompting",
+"short": "WorldMirror",
+"venue": "ICML'26",
+"venue_long": "International Conference on Machine Learning 2026",
+"authors": "Yifan Liu et al.",
+"contribution": "A unified feed-forward 3D reconstruction framework (WorldMirror) that flexibly integrates any combination of geometric priors (camera poses, intrinsics, depth maps) via multi-modal tokenization and simultaneously predicts point maps, depth, surface normals, camera parameters, and 3D Gaussians in a single forward pass, demonstrating that prior injection universally improves all output tasks through shared geometric representations.",
+"pdf": "https://raw.githubusercontent.com/mlresearch/v306/main/assets/liu26cw/liu26cw.pdf",
+"code": "https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror",
+"note": "ICML2026/papers/ICML20262881.md",
+"built_on_by": 3
+},
+"ICML20263465": {
+"title": "Beyond Heuristics: Learnable Density Control for 3D Gaussian Splatting",
+"short": "Beyond Heuristics",
+"venue": "ICML'26",
+"venue_long": "International Conference on Machine Learning 2026",
+"authors": "Zhenhua Ning et al.",
+"contribution": "Reformulates 3D Gaussian Splatting density control as a reinforcement learning problem with a sensitivity-based reward function and an O(N) closed-form ablation computation, achieving state-of-the-art novel view synthesis quality with compact Gaussian representations across three benchmarks.",
+"pdf": "https://raw.githubusercontent.com/mlresearch/v306/main/assets/ning26e/ning26e.pdf",
+"code": "https://github.com/AaronNZH/LeGS",
+"note": "ICML2026/papers/ICML20263465.md",
+"built_on_by": 0
+},
+"NEURIPS20240670": {
+"title": "WildGaussians: 3D Gaussian Splatting in the Wild",
+"short": "WildGaussians",
+"venue": "NEURIPS'24",
+"venue_long": "Advances in Neural Information Processing Systems 2024",
+"authors": "Jonas Kulhanek et al.",
+"contribution": "Extends 3D Gaussian Splatting to in-the-wild photo collections by introducing per-Gaussian and per-image appearance embeddings with an affine color transformation MLP, and a DINO cosine-similarity-based uncertainty loss for robust occlusion handling, achieving state-of-the-art novel view synthesis at real-time rendering speeds (108–117 FPS) while remaining compatible with standard 3DGS via 'baking' the appearance back into spherical harmonics.",
+"pdf": "https://proceedings.neurips.cc/paper_files/paper/2024/file/25c0fe7b157821dd3140727dc07461da-Paper-Conference.pdf",
+"code": "https://wild-gaussians.github.io/",
+"note": "NEURIPS2024/papers/NEURIPS20240670.md",
+"built_on_by": 4
+},
+"NEURIPS20242572": {
+"title": "3D Gaussian Splatting as Markov Chain Monte Carlo",
+"short": "3D Gaussian Splatting as Markov ...",
+"venue": "NEURIPS'24",
+"venue_long": "Advances in Neural Information Processing Systems 2024",
+"authors": "Shakiba Kheradmand et al.",
+"contribution": "Reformulates 3D Gaussian Splatting training as Markov Chain Monte Carlo sampling via Stochastic Gradient Langevin Dynamics, replacing heuristic-based densification and pruning with a probability-preserving relocation strategy and L1 regularization, achieving improved rendering quality and robustness to initialization across five standard benchmarks.",
+"pdf": "https://proceedings.neurips.cc/paper_files/paper/2024/file/93be245fce00a9bb2333c17ceae4b732-Paper-Conference.pdf",
+"code": "https://ubc-vision.github.io/3dgs-mcmc",
+"note": "NEURIPS2024/papers/NEURIPS20242572.md",
+"built_on_by": 19
+},
+"NEURIPS20243408": {
+"title": "FreeSplat: Generalizable 3D Gaussian Splatting Towards Free-View Synthesis of Indoor Scenes",
+"short": "FreeSplat",
+"venue": "NEURIPS'24",
+"venue_long": "Advances in Neural Information Processing Systems 2024",
+"authors": "Yunsong Wang et al.",
+"contribution": "FreeSplat introduces a generalizable 3D Gaussian Splatting framework that replaces transformer backbones with efficient CNNs and adaptive plane-sweep cost volumes, combined with a Pixel-wise Triplet Fusion module to eliminate Gaussian redundancy, enabling feed-forward reconstruction of geometrically consistent global 3D Gaussians from arbitrary-length indoor image sequences for free-view synthesis without depth priors.",
+"pdf": "https://proceedings.neurips.cc/paper_files/paper/2024/file/c2166d01fe4bcd694aba89f608737678-Paper-Conference.pdf",
+"code": "https://github.com/wangys16/FreeSplat",
+"note": "NEURIPS2024/papers/NEURIPS20243408.md",
+"built_on_by": 2
+},
+"NEURIPS20244446": {
+"title": "LightGaussian: Unbounded 3D Gaussian Compression with 15x Reduction and 200+ FPS",
+"short": "LightGaussian",
+"venue": "NEURIPS'24",
+"venue_long": "Advances in Neural Information Processing Systems 2024",
+"authors": "Zhiwen Fan et al.",
+"contribution": "A three-stage post-hoc compression pipeline for 3D Gaussian Splatting—combining global-significance-based Gaussian pruning with co-adaptation, SH knowledge distillation with pseudo-view augmentation, and significance-guided vector quantization—that achieves 15× storage reduction (782MB→45MB) while simultaneously increasing rendering speed from 144 to 237 FPS with negligible quality loss (SSIM drop of 0.007 on Mip-NeRF 360).",
+"pdf": "https://proceedings.neurips.cc/paper_files/paper/2024/file/fd881d3b625437354d4421818f81058f-Paper-Conference.pdf",
+"code": "https://lightgaussian.github.io",
+"note": "NEURIPS2024/papers/NEURIPS20244446.md",
+"built_on_by": 7
+},
+"NEURIPS20253629": {
+"title": "GeoSVR: Taming Sparse Voxels for Geometrically Accurate Surface Reconstruction",
+"short": "GeoSVR",
+"venue": "NEURIPS'25",
+"venue_long": "Advances in Neural Information Processing Systems 2025",
+"authors": "Jiahe Li et al.",
+"contribution": "GeoSVR introduces a sparse voxel-based surface reconstruction framework that combines a Voxel-Uncertainty Depth Constraint (adaptively weighting monocular depth cues by per-voxel geometric uncertainty) with Sparse Voxel Surface Regularization (voxel dropout, surface rectification, and scaling penalty) to achieve SOTA geometric accuracy on DTU (0.47 Chamfer) and Tanks and Temples (0.56 F1) while eliminating the SfM initialization dependency inherent to 3DGS-based methods.",
+"pdf": "https://proceedings.neurips.cc/paper_files/paper/2025/file/9ca825deb6ce588c96f880728d3b8aea-Paper-Conference.pdf",
+"code": "https://github.com/Fictionarry/GeoSVR",
+"note": "NEURIPS2025/papers/NEURIPS20253629.md",
+"built_on_by": 0
+},
+"NEURIPS20254534": {
+"title": "Optimized Minimal 3D Gaussian Splatting",
+"short": "Optimized Minimal 3D Gaussian Splatting",
+"venue": "NEURIPS'25",
+"venue_long": "Advances in Neural Information Processing Systems 2025",
+"authors": "Joo Chan Lee et al.",
+"contribution": "OMG, a 3DGS compression framework that minimizes Gaussian count via a local distinctiveness importance score and represents the resulting sparse set with a hybrid of per-Gaussian features and a tiny positional-encoding MLP, combined with Sub-Vector Quantization, achieving ~50% storage reduction over the previous SOTA (4.06 MB) while enabling 600+ FPS rendering with only 0.4M Gaussians.",
+"pdf": "https://proceedings.neurips.cc/paper_files/paper/2025/file/c6048c68a5e34a2bb34f9ad27e0f338b-Paper-Conference.pdf",
+"code": "https://maincold2.github.io/omg/",
+"note": "NEURIPS2025/papers/NEURIPS20254534.md",
+"built_on_by": 0
+}
+}</script>
+</body>
+</html>
